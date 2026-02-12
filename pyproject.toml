@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gka"
+version = "0.1.0"
+description = "Geometric Kernel Algorithm (GKA-II) modular diagnostics toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "GKA Contributors" }]
+keywords = ["diagnostics", "scaling", "parity", "spectral-analysis", "physics"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Science/Research"
+]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "pyarrow>=14.0",
+  "PyYAML>=6.0",
+  "scipy>=1.10",
+  "matplotlib>=3.8"
+]
+
+[project.urls]
+Homepage = "https://example.com/gka"
+Repository = "https://example.com/gka"
+
+[project.scripts]
+gka = "gka.cli.main:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=4.1",
+  "pre-commit>=3.7"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gka"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

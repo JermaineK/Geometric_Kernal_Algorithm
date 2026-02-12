@@ -1,0 +1,48 @@
+name: testF_eigen_stability
+domain: synthetic
+n_cases: 78
+L_values:
+  min: 6
+  max: 160
+  n: 24
+  spacing: log
+omega_values: 1.0
+baseline_B:
+  kind: power_law
+  amplitude: 4.5
+  exponent: 0.09
+eta_model:
+  type: eigen_stability
+  A: 0.06
+  L0: 25
+  gamma_values: [-0.5, 0.2, 1.0, 1.8]
+noise:
+  distribution: gaussian
+  std: 0.025
+  relative: true
+parity:
+  sign_mode: fixed_per_case
+  label_swap_prob: 0.0
+  pair_break: false
+run:
+  gka_config:
+    knee:
+      method: segmented
+      rho: 1.5
+      min_points: 6
+    scaling:
+      method: wls
+      min_sizes: 4
+      exclude_forbidden: true
+      bootstrap_n: 200
+    stability:
+      b: 2.0
+      gamma_min: 0.3
+      marginal_eps: 0.1
+    impedance:
+      enabled: false
+      tolerance: 0.1
+    nulls:
+      enabled: false
+      n: 0
+      models: []

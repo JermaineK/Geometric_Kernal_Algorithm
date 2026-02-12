@@ -1,0 +1,51 @@
+name: testC_forbidden_middle
+domain: synthetic
+n_cases: 80
+L_values:
+  min: 8
+  max: 190
+  n: 28
+  spacing: log
+omega_values: 1.0
+baseline_B:
+  kind: power_law
+  amplitude: 5.5
+  exponent: 0.1
+eta_model:
+  type: piecewise_forbidden
+  A: 0.12
+  L0: 25
+  L_k: 28
+  L_k2: 70
+  gamma_hi: 1.4
+  gamma_lo: 0.45
+  unstable_sigma: 0.22
+noise:
+  distribution: gaussian
+  std: 0.02
+  relative: true
+parity:
+  sign_mode: fixed_per_case
+  label_swap_prob: 0.0
+  pair_break: false
+truth:
+  knee_L: 28
+  forbidden_band: [28, 70]
+run:
+  gka_config:
+    knee:
+      method: segmented
+      rho: 1.6
+      min_points: 6
+    scaling:
+      method: wls
+      min_sizes: 4
+      exclude_forbidden: true
+      bootstrap_n: 250
+    impedance:
+      enabled: false
+      tolerance: 0.1
+    nulls:
+      enabled: false
+      n: 0
+      models: []

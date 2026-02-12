@@ -1,0 +1,24 @@
+knee:
+  method: cpt
+  rho: 1.4
+  min_points: 6
+scaling:
+  method: wls
+  min_sizes: 4
+  exclude_forbidden: true
+  ci: bootstrap
+  bootstrap_n: 300
+stability:
+  b: 2.0
+  gamma_min: 0.3
+  marginal_eps: 0.05
+impedance:
+  enabled: true
+  tolerance: 0.08
+ticks:
+  method: welch
+  ridge_min_snr: 3.5
+nulls:
+  enabled: true
+  n: 40
+  models: [time_shuffle, phase_scramble, block_bootstrap]

@@ -1,0 +1,82 @@
+global:
+  knee_confidence_threshold: 0.45
+
+tests:
+  testA_no_knee:
+    kind: no_knee
+    required: true
+    gamma_true: 1.5
+    gamma_tol: 0.12
+    gamma_within_rate_min: 0.9
+    false_knee_rate_max: 0.1
+    calibration:
+      catastrophic_abs_pct: 0.3
+      gamma_abs_pct_err_p50_max: 0.12
+      gamma_abs_pct_err_p90_max: 0.2
+      gamma_abs_pct_err_cat_rate_max: 0.05
+      band_class_accuracy_min: 0.9
+
+  testB_hybrid_knee:
+    kind: hybrid_knee
+    required: true
+    gamma_true: 1.8
+    pre_gamma_true: 1.8
+    pre_gamma_tol: 0.3
+    knee_true: 40
+    knee_tolerance_frac: 0.25
+    knee_rate_min: 0.75
+    pre_slope_rate_min: 0.7
+    flatten_factor: 0.9
+    flatten_rate_min: 0.7
+    forbidden_overlap_rate_min: 0.6
+    calibration:
+      catastrophic_abs_pct: 0.3
+      gamma_abs_pct_err_p50_max: 0.35
+      gamma_abs_pct_err_p90_max: 0.5
+      gamma_abs_pct_err_cat_rate_max: 0.15
+      xi_abs_pct_err_p50_max: 0.2
+      xi_abs_pct_err_p90_max: 0.3
+      xi_abs_pct_err_cat_rate_max: 0.1
+      band_class_accuracy_min: 0.85
+
+  testC_forbidden_middle:
+    kind: forbidden_middle
+    required: true
+    drift_threshold: 0.08
+    flagged_rate_min: 0.75
+    min_regime_delta: 0.35
+    regime_rate_min: 0.7
+    single_slope_delta_max: 0.2
+    confident_single_rate_max: 0.25
+    calibration:
+      catastrophic_abs_pct: 0.4
+      band_class_accuracy_min: 0.8
+
+  testD_parity_null:
+    kind: parity_null
+    required: true
+    eta_median_max: 0.22
+    abs_gamma_median_max: 0.35
+    p_lock_median_max: 0.35
+    knee_confidence_median_max: 0.55
+    calibration:
+      band_class_accuracy_min: 0.85
+
+  testE_impedance_align:
+    kind: impedance_align
+    required: false
+    ratio_mean_abs_error_max: 0.08
+    ratio_std_max: 0.1
+    calibration:
+      catastrophic_abs_pct: 0.3
+      omega_k_abs_pct_err_p50_max: 0.2
+      omega_k_abs_pct_err_p90_max: 0.3
+      omega_k_abs_pct_err_cat_rate_max: 0.1
+
+  testF_eigen_stability:
+    kind: eigen_stability
+    required: false
+    zero_eps: 0.1
+    accuracy_min: 0.85
+    calibration:
+      band_class_accuracy_min: 0.9

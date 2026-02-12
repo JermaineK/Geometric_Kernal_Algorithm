@@ -1,0 +1,24 @@
+knee:
+  method: segmented
+  rho: 1.6
+  min_points: 5
+scaling:
+  method: wls
+  min_sizes: 4
+  exclude_forbidden: true
+  ci: bootstrap
+  bootstrap_n: 400
+stability:
+  b: 2.0
+  gamma_min: 0.25
+  marginal_eps: 0.05
+impedance:
+  enabled: true
+  tolerance: 0.12
+ticks:
+  method: welch
+  ridge_min_snr: 2.5
+nulls:
+  enabled: true
+  n: 30
+  models: [time_shuffle, mirror_swap, phase_scramble, sign_flip]
