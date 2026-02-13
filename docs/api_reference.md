@@ -4,10 +4,12 @@
 
 - `gka prepare --domain <name> --in <raw> --out <dataset-dir>`
 - `gka validate <dataset-dir> [--allow-missing] [--json]`
-- `gka run <dataset-dir> --domain <name> --out <results-dir> [--config path] [--null N]`
+- `gka run <dataset-dir> --domain <name> --out <results-dir> [--config path] [--null N] [--dump-intermediates]`
 - `gka report --in <results-dir> --out <report.html>`
 - `gka diagnose --data <dataset-dir> [--domain <name>] [--config <path>]`
 - `gka calibrate --suite synthetic --runs 200`
+- `gka calibrate --suite stress --runs 200`
+- `gka audit <run-dir> [--json]`
 
 ## Core adapter protocol
 

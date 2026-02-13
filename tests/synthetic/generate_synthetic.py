@@ -59,6 +59,7 @@ def generate_dataset(config: dict[str, Any], seed: int, run_index: int = 0) -> G
     for case_idx in range(n_cases):
         if parity_cfg.get("sign_mode", "fixed_per_case") == "fixed_per_case":
             signs_by_case[case_idx] = int(rng.choice([-1, 1]))
+        t_counter = 0
 
         for L in L_values:
             for omega in omega_values:
@@ -76,6 +77,7 @@ def generate_dataset(config: dict[str, Any], seed: int, run_index: int = 0) -> G
 
                 row: dict[str, Any] = {
                     "case_id": f"case_{case_idx:04d}",
+                    "t": t_counter,
                     "L": float(L),
                     "omega": float(omega),
                     "O_L": float(max(o_left, 1e-8)),
@@ -95,9 +97,13 @@ def generate_dataset(config: dict[str, Any], seed: int, run_index: int = 0) -> G
                     truth["c"] = c_val
 
                 records.append(row)
+                t_counter += 1
 
     df = pd.DataFrame.from_records(records)
     df = _apply_parity_variants(df, parity_cfg, rng)
+    stress_cfg = config.get("stress", {})
+    if isinstance(stress_cfg, dict) and stress_cfg:
+        df = _apply_stress_transforms(df, stress_cfg, rng)
     df = df.sort_values(["case_id", "L", "omega"]).reset_index(drop=True)
 
     eta_obs = np.abs(df["O_L"] - df["O_R"]) / np.maximum((df["O_L"] + df["O_R"]) / 2.0, 1e-12)
@@ -118,6 +124,7 @@ def generate_dataset(config: dict[str, Any], seed: int, run_index: int = 0) -> G
             "eta_model": eta_cfg,
             "noise": noise_cfg,
             "parity": parity_cfg,
+            "stress": stress_cfg,
             "impedance": config.get("impedance", {}),
         },
     }
@@ -236,6 +243,37 @@ def _eta_value(
         gamma = float(gammas[run_index % len(gammas)])
         return A * ((float(L) / L0) ** gamma)
 
+    if model == "dual_hybrid_knee":
+        A1 = float(cfg.get("A1", cfg.get("A", 0.01)))
+        g1 = float(cfg.get("gamma1", 1.4))
+        xi1 = float(cfg.get("xi1", 24.0))
+        q1 = float(cfg.get("q1", 2.0))
+        A2 = float(cfg.get("A2", A1 * 0.8))
+        g2 = float(cfg.get("gamma2", 1.0))
+        xi2 = float(cfg.get("xi2", 70.0))
+        q2 = float(cfg.get("q2", 2.0))
+        L0 = float(cfg.get("L0", 1.0))
+        term1 = A1 * ((float(L) / L0) ** g1) * np.exp(-((float(L) / max(xi1, 1e-12)) ** q1))
+        term2 = A2 * ((float(L) / L0) ** g2) * np.exp(-((float(L) / max(xi2, 1e-12)) ** q2))
+        return term1 + term2
+
+    if model == "screened_power_law":
+        A = float(cfg.get("A", 0.02))
+        gamma = float(cfg.get("gamma", 1.0))
+        L0 = float(cfg.get("L0", 1.0))
+        xi = float(cfg.get("xi_screen", 30.0))
+        q = float(cfg.get("q_screen", 2.5))
+        base = A * ((float(L) / L0) ** gamma)
+        return base * np.exp(-((float(L) / max(xi, 1e-12)) ** q))
+
+    if model == "logistic_curve":
+        eta_min = float(cfg.get("eta_min", 0.01))
+        eta_max = float(cfg.get("eta_max", 0.35))
+        L0 = float(cfg.get("L0", 40.0))
+        width = max(float(cfg.get("width", 8.0)), 1e-6)
+        z = (float(L) - L0) / width
+        return eta_min + (eta_max - eta_min) / (1.0 + np.exp(-z))
+
     raise ValueError(f"Unsupported eta_model type '{model}'")
 
 
@@ -262,6 +300,23 @@ def _truth_from_model(cfg: dict[str, Any], run_index: int) -> dict[str, Any]:
         gamma = float(gammas[run_index % len(gammas)])
         truth["gamma"] = gamma
         truth["knee_L"] = None
+    elif model == "dual_hybrid_knee":
+        truth["gamma"] = float(cfg.get("gamma1", 1.4))
+        truth["knee_L"] = float(cfg.get("xi1", 24.0))
+        truth["knee_L2"] = float(cfg.get("xi2", 70.0))
+        truth["forbidden_band"] = [truth["knee_L"], truth["knee_L2"]]
+    elif model == "screened_power_law":
+        truth["gamma"] = float(cfg.get("gamma", 1.0))
+        truth["knee_L"] = float(cfg.get("xi_screen", 30.0))
+        truth["xi"] = float(cfg.get("xi_screen", 30.0))
+        # Optional explicit truth for stress controls where screening dominates.
+        truth["tau_s"] = _safe_float(cfg.get("tau_s"))
+    elif model == "logistic_curve":
+        truth["knee_L"] = None
+        truth["L0"] = float(cfg.get("L0", 40.0))
+        truth["width"] = float(cfg.get("width", 8.0))
+        truth["eta_min"] = float(cfg.get("eta_min", 0.01))
+        truth["eta_max"] = float(cfg.get("eta_max", 0.35))
     else:
         truth["knee_L"] = None
 
@@ -307,9 +362,174 @@ def _apply_noise(value: float, noise_cfg: dict[str, Any], rng: np.random.Generat
 
     if dist == "lognormal":
         scale = rng.lognormal(mean=0.0, sigma=std)
-        return float(value * scale)
+        out = float(value * scale)
+    elif dist == "laplace":
+        noise = rng.laplace(0.0, std)
+        out = float(value * (1.0 + noise) if relative else value + noise)
+    elif dist in {"student_t", "student-t", "t"}:
+        dof = float(noise_cfg.get("df", 3.0))
+        noise = rng.standard_t(max(dof, 1.1)) * std
+        out = float(value * (1.0 + noise) if relative else value + noise)
+    else:
+        raise ValueError(f"Unsupported noise distribution '{dist}'. Use gaussian|lognormal|laplace|student_t")
 
-    raise ValueError(f"Unsupported noise distribution '{dist}'. Use gaussian|lognormal")
+    burst_prob = float(noise_cfg.get("burst_prob", 0.0))
+    burst_scale = float(noise_cfg.get("burst_scale", 0.0))
+    if burst_prob > 0 and rng.random() < burst_prob:
+        burst = rng.normal(0.0, burst_scale)
+        out = float(out * (1.0 + burst) if relative else out + burst)
+    return out
+
+
+def _apply_stress_transforms(
+    df: pd.DataFrame,
+    stress_cfg: dict[str, Any],
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    out = df.copy()
+    out["t"] = pd.to_numeric(out["t"], errors="coerce").fillna(0.0).astype(float)
+
+    if bool(stress_cfg.get("nonstationary_baseline", False)):
+        drift = float(stress_cfg.get("drift_strength", 0.25))
+        vol = float(stress_cfg.get("variance_strength", 0.1))
+        for _, idx in out.groupby("case_id").groups.items():
+            n = len(idx)
+            if n <= 1:
+                continue
+            t_norm = np.linspace(0.0, 1.0, n)
+            trend = np.exp(drift * t_norm + vol * rng.normal(0.0, 1.0, size=n) * np.sqrt(np.maximum(t_norm, 1e-8)))
+            out.loc[idx, "O_L"] *= trend
+            out.loc[idx, "O_R"] *= trend
+
+    if bool(stress_cfg.get("temporal_warp", False)):
+        warp_jitter = float(stress_cfg.get("warp_jitter", 0.35))
+        for _, idx in out.groupby("case_id").groups.items():
+            n = len(idx)
+            if n <= 1:
+                continue
+            increments = np.maximum(1e-3, 1.0 + rng.normal(0.0, warp_jitter, size=n))
+            warped = np.cumsum(increments)
+            out.loc[idx, "t"] = warped
+
+    if bool(stress_cfg.get("one_over_f_noise", False)):
+        alpha = float(stress_cfg.get("one_over_f_alpha", 1.0))
+        scale = float(stress_cfg.get("one_over_f_scale", 0.12))
+        for _, idx in out.sort_values(["case_id", "t", "L"]).groupby("case_id").groups.items():
+            n = len(idx)
+            if n <= 3:
+                continue
+            colored = _colored_noise(n=n, alpha=alpha, rng=rng)
+            out.loc[idx, "O_L"] *= np.maximum(1e-3, 1.0 + scale * colored)
+            out.loc[idx, "O_R"] *= np.maximum(1e-3, 1.0 + scale * colored)
+
+    if bool(stress_cfg.get("heavy_tail", False)):
+        scale = float(stress_cfg.get("heavy_tail_scale", 0.08))
+        dof = float(stress_cfg.get("heavy_tail_df", 3.0))
+        noise = rng.standard_t(max(dof, 1.1), size=len(out)) * scale
+        out["O_L"] *= np.maximum(1e-3, 1.0 + noise)
+        out["O_R"] *= np.maximum(1e-3, 1.0 + noise)
+
+    if bool(stress_cfg.get("confound_even", False)):
+        strength = float(stress_cfg.get("confound_strength", 0.6))
+        center = float(stress_cfg.get("confound_center_L", np.nanmedian(out["L"].to_numpy(dtype=float))))
+        width = float(stress_cfg.get("confound_width_L", max(1.0, np.nanstd(out["L"].to_numpy(dtype=float)))))
+        z = (out["L"].to_numpy(dtype=float) - center) / max(width, 1e-6)
+        event = 1.0 / (1.0 + np.exp(-z))
+        even_term = np.maximum(0.0, strength * event)
+        out["O_L"] *= (1.0 + even_term)
+        out["O_R"] *= (1.0 + even_term)
+
+    if bool(stress_cfg.get("spatial_aliasing", False)):
+        jitter = float(stress_cfg.get("alias_jitter", 0.1))
+        blur = float(stress_cfg.get("alias_blur", 0.05))
+        scale = np.maximum(1e-3, 1.0 + rng.normal(0.0, jitter, size=len(out)))
+        out["O_L"] *= scale
+        out["O_R"] *= scale
+        out["O_L"] = out["O_L"].rolling(3, min_periods=1, center=True).mean() * (1.0 - blur) + out["O_L"] * blur
+        out["O_R"] = out["O_R"].rolling(3, min_periods=1, center=True).mean() * (1.0 - blur) + out["O_R"] * blur
+
+    if bool(stress_cfg.get("missing_blocks", False)):
+        block_frac = float(stress_cfg.get("missing_block_frac", 0.08))
+        random_frac = float(stress_cfg.get("missing_random_frac", 0.03))
+        keep_mask = np.ones(len(out), dtype=bool)
+        # Drop contiguous blocks in each case after sorting by t.
+        for _, idx in out.sort_values(["case_id", "t", "L"]).groupby("case_id").groups.items():
+            n = len(idx)
+            if n < 8:
+                continue
+            block = int(max(1, round(n * block_frac)))
+            if block >= n:
+                continue
+            start = int(rng.integers(0, max(1, n - block)))
+            drop_idx = np.asarray(idx)[start : start + block]
+            keep_mask[drop_idx] = False
+        # Additional random drop.
+        if random_frac > 0:
+            rand_drop = rng.random(len(out)) < random_frac
+            keep_mask &= ~rand_drop
+        out = out.loc[keep_mask].copy()
+
+    if bool(stress_cfg.get("duplicate_timestamps", False)):
+        frac = float(stress_cfg.get("duplicate_timestamp_frac", 0.15))
+        if frac > 0:
+            quant = max(1, int(round(1.0 / max(frac, 1e-6))))
+            t_vals = pd.to_numeric(out["t"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            out["t"] = np.floor(t_vals / quant) * quant
+
+    if bool(stress_cfg.get("sign_flip_by_scale", False)):
+        flip_prob = float(stress_cfg.get("sign_flip_prob_scale", 0.5))
+        for _, idx in out.groupby("L").groups.items():
+            if rng.random() < flip_prob:
+                tmp = out.loc[idx, "O_L"].to_numpy(copy=True)
+                out.loc[idx, "O_L"] = out.loc[idx, "O_R"].to_numpy()
+                out.loc[idx, "O_R"] = tmp
+
+    if bool(stress_cfg.get("sparse_random_peaks", False)):
+        peak_prob = float(stress_cfg.get("sparse_peak_prob", 0.05))
+        peak_scale = float(stress_cfg.get("sparse_peak_scale", 0.8))
+        peak_width = max(float(stress_cfg.get("sparse_peak_width", 1.0)), 1e-6)
+        mask = rng.random(len(out)) < peak_prob
+        if np.any(mask):
+            peak_gain = np.exp(rng.normal(loc=np.log1p(max(peak_scale, 0.0)), scale=peak_width, size=int(mask.sum())))
+            side = rng.random(int(mask.sum())) < 0.5
+            masked_index = np.flatnonzero(mask)
+            left_idx = masked_index[side]
+            right_idx = masked_index[~side]
+            if left_idx.size:
+                out.loc[left_idx, "O_L"] *= peak_gain[side]
+            if right_idx.size:
+                out.loc[right_idx, "O_R"] *= peak_gain[~side]
+
+    out["O_L"] = np.maximum(out["O_L"].to_numpy(dtype=float), 1e-8)
+    out["O_R"] = np.maximum(out["O_R"].to_numpy(dtype=float), 1e-8)
+    return out.reset_index(drop=True)
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _colored_noise(n: int, alpha: float, rng: np.random.Generator) -> np.ndarray:
+    if n <= 1:
+        return np.zeros(max(n, 1), dtype=float)
+    alpha = max(alpha, 0.0)
+    freqs = np.fft.rfftfreq(n)
+    amp = np.ones_like(freqs)
+    nonzero = freqs > 0
+    amp[nonzero] = np.power(freqs[nonzero], -alpha / 2.0)
+    phase = rng.uniform(0.0, 2.0 * np.pi, size=freqs.shape[0])
+    spectrum = amp * (np.cos(phase) + 1j * np.sin(phase))
+    noise = np.fft.irfft(spectrum, n=n)
+    noise = noise - np.mean(noise)
+    std = float(np.std(noise, ddof=0))
+    if std <= 1e-12:
+        return np.zeros(n, dtype=float)
+    return noise / std
 
 
 def _apply_parity_variants(

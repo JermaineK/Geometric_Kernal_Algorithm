@@ -6,7 +6,7 @@ import numpy as np
 
 from gka.core.types import ScalingOutputs
 from gka.stats.bootstrap import bootstrap_slope_ci
-from gka.stats.regression import fit_theil_sen, fit_wls
+from gka.stats.regression import fit_huber, fit_theil_sen, fit_wls
 from gka.utils.safe_math import safe_log
 
 
@@ -16,6 +16,8 @@ def fit_scaling(
     exclude_band: tuple[float, float] | None,
     weights: np.ndarray | None,
     method: str,
+    robust: bool = True,
+    huber_delta: float = 1.5,
     min_sizes: int = 4,
     bootstrap_n: int = 1000,
     rng: np.random.Generator | None = None,
@@ -41,13 +43,17 @@ def fit_scaling(
 
     if method == "wls":
         w = np.ones_like(x) if weights is None else np.asarray(weights, dtype=float)[mask]
-        slope, intercept, residuals = fit_wls(x, y, w)
+        if robust:
+            slope, intercept, residuals = fit_huber(x, y, w=w, delta=float(huber_delta))
+        else:
+            slope, intercept, residuals = fit_wls(x, y, w)
     elif method == "theil_sen":
         slope, intercept, residuals = fit_theil_sen(x, y)
     else:
         raise ValueError(f"Unsupported scaling method '{method}'. Use wls|theil_sen")
 
-    ci_lo, ci_hi = bootstrap_slope_ci(x, y, method=method, n=bootstrap_n, rng=rng)
+    ci_method = "theil_sen" if (method == "wls" and robust) else method
+    ci_lo, ci_hi = bootstrap_slope_ci(x, y, method=ci_method, n=bootstrap_n, rng=rng)
     drift = _drift_metric(x, residuals)
     gamma = float(slope)
     return ScalingOutputs(

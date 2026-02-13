@@ -1,0 +1,60 @@
+name: stressE_impedance_aliasing
+domain: synthetic
+n_cases: 86
+L_values:
+  min: 10
+  max: 220
+  n: 26
+  spacing: log
+omega_values: 1.0
+baseline_B:
+  kind: power_law
+  amplitude: 5.2
+  exponent: 0.08
+eta_model:
+  type: hybrid_knee
+  A: 0.05
+  L0: 24
+  gamma: 1.2
+  xi: 50
+  q: 2.0
+  decay_scale_frac: 0.55
+noise:
+  distribution: gaussian
+  std: 0.018
+  relative: true
+parity:
+  sign_mode: fixed_per_case
+  label_swap_prob: 0.0
+  pair_break: false
+stress:
+  spatial_aliasing: true
+  alias_jitter: 0.18
+  alias_blur: 0.12
+  temporal_warp: true
+  warp_jitter: 0.25
+impedance:
+  enabled: true
+  c: 11.0
+  jitter_std: 0.03
+truth:
+  gamma: 1.2
+  knee_L: 50
+run:
+  gka_config:
+    knee:
+      method: segmented
+      rho: 1.5
+      min_points: 6
+    scaling:
+      method: wls
+      min_sizes: 4
+      exclude_forbidden: true
+      bootstrap_n: 250
+    impedance:
+      enabled: true
+      tolerance: 0.14
+    nulls:
+      enabled: false
+      n: 0
+      models: []

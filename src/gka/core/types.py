@@ -104,6 +104,16 @@ class KneeOutputs:
     slope_left: float | None
     slope_right: float | None
     rejection_reasons: list[str]
+    knee_p: float = 0.0
+    knee_ci: tuple[float | None, float | None] = (None, None)
+    knee_strength: float = 0.0
+    delta_gamma: float | None = None
+    resid_improvement: float | None = None
+    middle_score: float | None = None
+    middle_label: str = "resolved"
+    post_slope_std: float | None = None
+    curvature_peak_ratio: float | None = None
+    curvature_alignment: float | None = None
 
 
 @dataclass(frozen=True)

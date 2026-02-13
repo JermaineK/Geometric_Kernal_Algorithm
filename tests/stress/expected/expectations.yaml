@@ -1,0 +1,216 @@
+global:
+  knee_confidence_threshold: 0.45
+  knee_p_positive_min: 0.025
+  knee_strength_positive_min: 0.0
+  knee_delta_bic_positive_min: 0.0
+  robustness:
+    false_positive_rate_max: 0.10
+    false_negative_rate_max: 0.35
+    blind_accuracy_min: 0.80
+    blind_auroc_min: 0.85
+    knee_localization_err_p90_max: 0.08
+
+tests:
+  stressA_nonstationary_no_knee:
+    kind: no_knee
+    required: true
+    gamma_true: 1.3
+    gamma_tol: 0.3
+    gamma_within_rate_min: 0.7
+    false_knee_rate_max: 0.2
+    calibration:
+      catastrophic_abs_pct: 0.35
+      gamma_abs_pct_err_p50_max: 0.22
+      gamma_abs_pct_err_p90_max: 0.35
+      gamma_abs_pct_err_cat_rate_max: 0.2
+      band_class_accuracy_min: 0.7
+
+  stressB_hybrid_heavytail:
+    kind: hybrid_knee
+    required: true
+    gamma_true: 1.8
+    pre_gamma_true: 1.8
+    pre_gamma_tol: 0.45
+    knee_true: 42
+    knee_tolerance_frac: 0.35
+    knee_rate_min: 0.55
+    pre_slope_rate_min: 0.55
+    flatten_factor: 0.92
+    flatten_rate_min: 0.55
+    forbidden_overlap_rate_min: 0.5
+    calibration:
+      catastrophic_abs_pct: 0.4
+      gamma_abs_pct_err_p50_max: 0.28
+      gamma_abs_pct_err_p90_max: 0.45
+      gamma_abs_pct_err_cat_rate_max: 0.2
+      xi_abs_pct_err_p50_max: 0.3
+      xi_abs_pct_err_p90_max: 0.45
+      xi_abs_pct_err_cat_rate_max: 0.2
+      band_class_accuracy_min: 0.65
+
+  stressC_mixture_regimes:
+    kind: forbidden_middle
+    required: true
+    drift_threshold: 0.06
+    flagged_rate_min: 0.65
+    min_regime_delta: 0.30
+    regime_rate_min: 0.55
+    single_slope_delta_max: 0.22
+    confident_single_rate_max: 0.35
+    calibration:
+      catastrophic_abs_pct: 0.5
+      band_class_accuracy_min: 0.65
+
+  stressD_parity_null_confound:
+    kind: parity_null
+    required: true
+    eta_median_max: 0.30
+    abs_gamma_median_max: 0.45
+    p_lock_median_max: 0.45
+    knee_confidence_median_max: 0.60
+    calibration:
+      band_class_accuracy_min: 0.8
+
+  stressE_impedance_aliasing:
+    kind: impedance_align
+    required: false
+    ratio_mean_abs_error_max: 0.16
+    ratio_std_max: 0.18
+    calibration:
+      catastrophic_abs_pct: 0.4
+      omega_k_abs_pct_err_p50_max: 0.28
+      omega_k_abs_pct_err_p90_max: 0.42
+      omega_k_abs_pct_err_cat_rate_max: 0.2
+
+  stressF_screening_control:
+    kind: screening_control
+    required: true
+    gamma_positive_min: 0.05
+    gamma_positive_rate_min: 0.65
+    band_incoherent_rate_min: 0.7
+    knee_rate_max: 0.35
+    calibration:
+      catastrophic_abs_pct: 0.4
+      gamma_abs_pct_err_p50_max: 0.35
+      gamma_abs_pct_err_p90_max: 0.5
+      gamma_abs_pct_err_cat_rate_max: 0.25
+      band_class_accuracy_min: 0.8
+
+  stressG_heavytail_1f_no_knee:
+    kind: no_knee
+    required: true
+    gamma_true: 1.35
+    gamma_tol: 0.35
+    gamma_within_rate_min: 0.65
+    false_knee_rate_max: 0.2
+    calibration:
+      catastrophic_abs_pct: 0.45
+      gamma_abs_pct_err_p50_max: 0.3
+      gamma_abs_pct_err_p90_max: 0.45
+      gamma_abs_pct_err_cat_rate_max: 0.2
+      band_class_accuracy_min: 0.65
+
+  stressH_fake_knee_logistic:
+    kind: logistic_fake_knee
+    required: true
+    false_knee_rate_max: 0.25
+    coherent_rate_max: 0.9
+    forbidden_middle_rate_max: 0.95
+    calibration:
+      band_class_accuracy_min: 0.7
+
+  stressI_sign_flip_parity:
+    kind: parity_null
+    required: true
+    eta_median_max: 0.35
+    abs_gamma_median_max: 0.5
+    p_lock_median_max: 0.45
+    knee_confidence_median_max: 0.65
+    calibration:
+      band_class_accuracy_min: 0.8
+
+  stressJ_correlated_non_spiral:
+    kind: correlated_non_spiral
+    required: true
+    ratio_mean_abs_error_max: 0.16
+    ratio_std_max: 0.2
+    band_incoherent_rate_min: 0.7
+    knee_rate_max: 0.4
+    calibration:
+      catastrophic_abs_pct: 0.45
+      gamma_abs_pct_err_p50_max: 0.45
+      gamma_abs_pct_err_p90_max: 0.55
+      gamma_abs_pct_err_cat_rate_max: 0.3
+      band_class_accuracy_min: 0.75
+
+  stressK_sparse_spectral_peaks:
+    kind: sparse_peaks
+    required: true
+    false_knee_rate_max: 0.25
+    coherent_rate_max: 0.4
+    band_hit_rate_p50_max: 0.5
+    calibration:
+      catastrophic_abs_pct: 0.45
+      gamma_abs_pct_err_p50_max: 0.35
+      gamma_abs_pct_err_p90_max: 0.5
+      gamma_abs_pct_err_cat_rate_max: 0.25
+      band_class_accuracy_min: 0.6
+
+  stressL_low_contrast_real_knee:
+    kind: hybrid_knee
+    required: true
+    gamma_true: 1.35
+    pre_gamma_true: 1.35
+    pre_gamma_tol: 0.5
+    knee_true: 48
+    knee_tolerance_frac: 0.45
+    knee_rate_min: 0.35
+    pre_slope_rate_min: 0.35
+    flatten_factor: 0.97
+    flatten_rate_min: 0.35
+    forbidden_overlap_rate_min: 0.35
+    calibration:
+      catastrophic_abs_pct: 0.45
+      gamma_abs_pct_err_p50_max: 0.35
+      gamma_abs_pct_err_p90_max: 0.55
+      gamma_abs_pct_err_cat_rate_max: 0.3
+      xi_abs_pct_err_p50_max: 0.45
+      xi_abs_pct_err_p90_max: 0.65
+      xi_abs_pct_err_cat_rate_max: 0.3
+      band_class_accuracy_min: 0.6
+
+  stressM_multiknee:
+    kind: forbidden_middle
+    required: true
+    drift_threshold: 0.06
+    flagged_rate_min: 0.65
+    min_regime_delta: 0.25
+    regime_rate_min: 0.5
+    single_slope_delta_max: 0.22
+    confident_single_rate_max: 0.4
+    calibration:
+      catastrophic_abs_pct: 0.5
+      band_class_accuracy_min: 0.6
+
+  stressN_timewarp_knee:
+    kind: hybrid_knee
+    required: true
+    gamma_true: 1.6
+    pre_gamma_true: 1.6
+    pre_gamma_tol: 0.55
+    knee_true: 45
+    knee_tolerance_frac: 0.45
+    knee_rate_min: 0.4
+    pre_slope_rate_min: 0.4
+    flatten_factor: 0.92
+    flatten_rate_min: 0.4
+    forbidden_overlap_rate_min: 0.35
+    calibration:
+      catastrophic_abs_pct: 0.5
+      gamma_abs_pct_err_p50_max: 0.4
+      gamma_abs_pct_err_p90_max: 0.6
+      gamma_abs_pct_err_cat_rate_max: 0.3
+      xi_abs_pct_err_p50_max: 0.45
+      xi_abs_pct_err_p90_max: 0.65
+      xi_abs_pct_err_cat_rate_max: 0.3
+      band_class_accuracy_min: 0.6

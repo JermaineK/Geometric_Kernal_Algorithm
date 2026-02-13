@@ -15,6 +15,7 @@ from gka.core.types import DatasetBundle, PipelineResult
 from gka.core.versioning import git_commit_hash, invocation_string, package_versions
 from gka.data.io import load_dataset_spec, write_json
 from gka.data.validators import report_to_dict, validate_dataset
+from gka.metrics.forbidden_middle import compute_forbidden_middle_score
 from gka.ops.coherence import compute_coherence_metrics
 from gka.ops.diagnostics import (
     alignment_residual,
@@ -30,6 +31,7 @@ from gka.ops.spectrum import extract_ticks
 from gka.ops.stability import classify_stability
 from gka.stats.null_models import apply_null_model, parity_significance_pvalues
 from gka.utils.hash import dataset_hash
+from gka.utils.safe_math import safe_log
 from gka.utils.time import utc_now_iso
 
 
@@ -45,6 +47,7 @@ def run_pipeline(
     null_n: int | None,
     allow_missing: bool,
     seed: int | None,
+    dump_intermediates: bool = False,
     argv: list[str] | None = None,
 ) -> PipelineResult:
     dataset_root = Path(dataset_path)
@@ -77,9 +80,12 @@ def run_pipeline(
     adapter = get_adapter(domain_name)
     bundle = adapter.load(str(dataset_root))
 
-    results_df, stage_context = _run_core(bundle, adapter=adapter, cfg=resolved, rng=rng)
+    results_df, stage_context, intermediates = _run_core(bundle, adapter=adapter, cfg=resolved, rng=rng)
     results_path = out_root / "results.parquet"
     results_df.to_parquet(results_path, index=False)
+
+    if dump_intermediates:
+        _write_intermediates(out_root / "intermediates", intermediates)
 
     null_summary_df = None
     if resolved.get("nulls", {}).get("enabled", False):
@@ -114,6 +120,7 @@ def run_pipeline(
         else 0,
         "validation": report_to_dict(validation),
         "stage_context": stage_context,
+        "dump_intermediates": bool(dump_intermediates),
     }
     write_json(metadata, out_root / "run_metadata.json")
 
@@ -125,7 +132,7 @@ def _run_core(
     adapter,
     cfg: dict[str, Any],
     rng: np.random.Generator,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
     obs = adapter.observable(bundle)
     X = np.asarray(obs.X, dtype=float)
     pair_df = _build_pair_table(bundle, X)
@@ -140,14 +147,22 @@ def _run_core(
         rho=float(cfg["knee"]["rho"]),
         min_points=int(cfg["knee"].get("min_points", 6)),
         bic_delta_min=float(cfg["knee"].get("bic_delta_min", 10.0)),
+        knee_p_min=float(cfg["knee"].get("knee_p_min", 0.35)),
+        knee_strength_min=float(cfg["knee"].get("knee_strength_min", 0.5)),
+        max_candidates=int(cfg["knee"].get("max_candidates", 6)),
         bootstrap_n=int(cfg["knee"].get("bootstrap_n", 200)),
         bootstrap_cov_max=float(cfg["knee"].get("bootstrap_cov_max", 0.25)),
         edge_buffer_frac=float(cfg["knee"].get("edge_buffer_frac", 0.15)),
         min_points_each_side=int(cfg["knee"].get("min_points_each_side", 3)),
         min_frac_each_side=float(cfg["knee"].get("min_frac_each_side", 0.2)),
         slope_abs_max=float(cfg["knee"].get("slope_abs_max", 6.0)),
+        post_slope_max=float(cfg["knee"].get("post_slope_max", 6.0)),
+        resid_improvement_min=float(cfg["knee"].get("resid_improvement_min", 0.0)),
+        curvature_peak_ratio_min=float(cfg["knee"].get("curvature_peak_ratio_min", 0.0)),
+        curvature_alignment_min=float(cfg["knee"].get("curvature_alignment_min", 0.0)),
         instability_window=int(cfg["knee"].get("instability_window", 7)),
         instability_zscore=float(cfg["knee"].get("instability_zscore", 2.0)),
+        middle_score_threshold=float(cfg["knee"].get("middle_score_threshold", 0.6)),
         rng=rng,
     )
 
@@ -161,6 +176,8 @@ def _run_core(
         exclude_band=exclude_band,
         weights=per_size["n"].to_numpy(dtype=float),
         method=cfg["scaling"]["method"],
+        robust=bool(cfg["scaling"].get("robust", True)),
+        huber_delta=float(cfg["scaling"].get("huber_delta", 1.5)),
         min_sizes=int(cfg["scaling"].get("min_sizes", 4)),
         bootstrap_n=int(cfg["scaling"].get("bootstrap_n", 1000)),
         rng=rng,
@@ -202,6 +219,20 @@ def _run_core(
         eps_log=float(stability_cfg.get("eps_log", 0.15)),
         L_values=per_size["L"].to_numpy(dtype=float),
         c_m_hat=c_m_hat,
+    )
+
+    middle = compute_forbidden_middle_score(
+        knee_probability=float(knee.knee_p),
+        knee_ci=knee.knee_ci,
+        L_bounds=(
+            float(np.min(per_size["L"].to_numpy(dtype=float))),
+            float(np.max(per_size["L"].to_numpy(dtype=float))),
+        ),
+        knee_strength=float(knee.knee_strength),
+        delta_gamma=knee.delta_gamma,
+        slope_drift=float(scaling.drift),
+        ridge_strength=float(ticks.ridge_strength),
+        threshold=float(cfg["knee"].get("middle_score_threshold", 0.6)),
     )
 
     bands_cfg = cfg.get("bands", {})
@@ -250,12 +281,25 @@ def _run_core(
             n_perm=int(parity_sig_cfg.get("n_perm", 200)),
             rng=rng,
             alpha=float(parity_sig_cfg.get("alpha", 0.05)),
+            eta_min=float(parity_sig_cfg.get("eta_min", 0.03)),
+            direction_min=float(parity_sig_cfg.get("direction_min", 0.30)),
         )
     else:
-        parity_sig = {"mirror_stat": float(np.median(pair_df["eta"])), "p_perm": 0.0, "p_dir": 0.0, "signal_pass": True}
+        signed = pair_df["signed_parity"].to_numpy(dtype=float)
+        obs_dir = float(np.abs(np.mean(np.sign(signed)))) if signed.size else 0.0
+        parity_sig = {
+            "mirror_stat": float(np.median(pair_df["eta"])),
+            "obs_dir": obs_dir,
+            "p_perm": 0.0,
+            "p_dir": 0.0,
+            "mirror_pass": True,
+            "direction_pass": True,
+            "signal_pass": True,
+        }
 
     knee_confidence = float(knee.confidence if parity_sig["signal_pass"] else 0.0)
-    knee_detected = bool(knee.has_knee and knee_confidence > 0)
+    knee_detected = bool(knee.has_knee and knee_confidence > 0 and middle.label != "forbidden_middle")
+    band_class_hat = "forbidden_middle" if middle.label == "forbidden_middle" else sdiag.band_class_hat
     forbidden_lo, forbidden_hi = _band_values(knee.forbidden_band)
 
     out = per_size.copy()
@@ -268,6 +312,17 @@ def _run_core(
     out["forbidden_hi"] = forbidden_hi
     out["knee_confidence"] = knee_confidence
     out["knee_detected"] = knee_detected
+    out["knee_p"] = knee.knee_p
+    out["knee_ci_lo"] = _nan_or_value(knee.knee_ci[0])
+    out["knee_ci_hi"] = _nan_or_value(knee.knee_ci[1])
+    out["knee_strength"] = knee.knee_strength
+    out["knee_delta_gamma"] = _nan_or_value(knee.delta_gamma)
+    out["knee_resid_improvement"] = _nan_or_value(knee.resid_improvement)
+    out["knee_post_slope_std"] = _nan_or_value(knee.post_slope_std)
+    out["knee_curvature_peak_ratio"] = _nan_or_value(knee.curvature_peak_ratio)
+    out["knee_curvature_alignment"] = _nan_or_value(knee.curvature_alignment)
+    out["middle_score"] = _nan_or_value(middle.score)
+    out["middle_label"] = middle.label
     out["knee_delta_bic"] = knee.delta_bic
     out["knee_bic_no_knee"] = knee.bic_no_knee
     out["knee_bic_knee"] = knee.bic_knee
@@ -293,6 +348,7 @@ def _run_core(
     out["parity_mirror_stat"] = float(parity_sig["mirror_stat"])
     out["parity_p_perm"] = float(parity_sig["p_perm"])
     out["parity_p_dir"] = float(parity_sig["p_dir"])
+    out["parity_obs_dir"] = float(parity_sig["obs_dir"])
     out["parity_signal_pass"] = bool(parity_sig["signal_pass"])
     out["R_Omega"] = ticks.R_Omega
     out["ridge_strength"] = ticks.ridge_strength
@@ -302,7 +358,7 @@ def _run_core(
     out["S_margin_log"] = _nan_or_value(sdiag.S_margin_log)
     out["W_mu"] = _nan_or_value(sdiag.W_mu)
     out["W_L"] = _nan_or_value(sdiag.W_L)
-    out["band_class_hat"] = sdiag.band_class_hat
+    out["band_class_hat"] = band_class_hat
     out["c_m_hat"] = _nan_or_value(c_m_hat)
     out["R_align"] = _nan_or_value(r_align)
     out["M_Z"] = _nan_or_value(m_z)
@@ -316,8 +372,16 @@ def _run_core(
         "scaling_points": scaling.n_points,
         "knee_detected": knee_detected,
         "knee_delta_bic": knee.delta_bic,
+        "knee_p": knee.knee_p,
+        "knee_strength": knee.knee_strength,
+        "knee_post_slope_std": knee.post_slope_std,
+        "knee_curvature_peak_ratio": knee.curvature_peak_ratio,
+        "knee_curvature_alignment": knee.curvature_alignment,
+        "middle_score": middle.score,
+        "middle_label": middle.label,
         "parity_p_perm": float(parity_sig["p_perm"]),
         "parity_p_dir": float(parity_sig["p_dir"]),
+        "parity_obs_dir": float(parity_sig["obs_dir"]),
         "parity_signal_pass": bool(parity_sig["signal_pass"]),
         "knee_rejection_reasons": knee.rejection_reasons,
         "S_curve_mu": sdiag.S_curve_mu.tolist(),
@@ -325,7 +389,57 @@ def _run_core(
         "predicted_bands": predicted.tolist(),
         "band_hit_rate": float(hit_rate),
     }
-    return out, stage_context
+    scaling_points = _build_scaling_points(
+        per_size=per_size,
+        exclude_band=exclude_band,
+    )
+    stability_curve = pd.DataFrame(
+        {
+            "mu": sdiag.S_curve_mu,
+            "S": sdiag.S_curve_values,
+        }
+    )
+    intermediates = {
+        "windowed_series": per_size,
+        "scaling_points": scaling_points,
+        "stability_curve": stability_curve,
+        "knee_candidates": {
+            "L_k": knee.L_k,
+            "knee_window": list(knee.knee_window),
+            "forbidden_band": list(knee.forbidden_band),
+            "confidence": knee.confidence,
+            "delta_bic": knee.delta_bic,
+            "bic_no_knee": knee.bic_no_knee,
+            "bic_knee": knee.bic_knee,
+            "bootstrap_cov": knee.bootstrap_cov,
+            "bootstrap_count": knee.bootstrap_count,
+            "knee_p": knee.knee_p,
+            "knee_ci": list(knee.knee_ci),
+            "knee_strength": knee.knee_strength,
+            "delta_gamma": knee.delta_gamma,
+            "resid_improvement": knee.resid_improvement,
+            "rejection_reasons": knee.rejection_reasons,
+        },
+        "spectrum_candidates": {
+            "Omega_candidates": ticks.Omega_candidates.tolist(),
+            "omega_band": ticks.omega_band,
+            "R_Omega": ticks.R_Omega,
+            "ridge_strength": ticks.ridge_strength,
+        },
+        "parity_diagnostics": {
+            "mirror_stat": float(parity_sig["mirror_stat"]),
+            "p_perm": float(parity_sig["p_perm"]),
+            "p_dir": float(parity_sig["p_dir"]),
+            "signal_pass": bool(parity_sig["signal_pass"]),
+            "P_lock": float(coherence.P_lock),
+        },
+        "forbidden_middle": {
+            "score": middle.score,
+            "label": middle.label,
+            "components": middle.components,
+        },
+    }
+    return out, stage_context, intermediates
 
 
 def _aggregate_eta_by_size(pair_df: pd.DataFrame) -> pd.DataFrame:
@@ -493,7 +607,7 @@ def _run_nulls(
         )
 
         try:
-            result_df, _ = _run_core(null_bundle, adapter=adapter, cfg=cfg, rng=rng)
+            result_df, _, _ = _run_core(null_bundle, adapter=adapter, cfg=cfg, rng=rng)
             gamma = float(result_df["gamma"].iloc[0])
             L_k = float(result_df["L_k"].iloc[0])
             eta_mean = float(result_df["eta"].mean())
@@ -526,3 +640,29 @@ def _array_or_empty(value: np.ndarray | float | None) -> np.ndarray:
 def _positive_finite(values: np.ndarray) -> np.ndarray:
     arr = np.asarray(values, dtype=float).reshape(-1)
     return np.unique(arr[np.isfinite(arr) & (arr > 0)])
+
+
+def _build_scaling_points(
+    per_size: pd.DataFrame,
+    exclude_band: tuple[float, float] | None,
+) -> pd.DataFrame:
+    df = per_size.copy()
+    include = np.ones(df.shape[0], dtype=bool)
+    if exclude_band is not None:
+        lo, hi = exclude_band
+        include &= ~((df["L"].to_numpy(dtype=float) >= lo) & (df["L"].to_numpy(dtype=float) <= hi))
+    df["included"] = include
+    df["log_L"] = safe_log(df["L"].to_numpy(dtype=float))
+    df["log_eta"] = safe_log(np.abs(df["eta"].to_numpy(dtype=float)) + 1e-12)
+    return df
+
+
+def _write_intermediates(out_dir: Path, intermediates: dict[str, Any]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, value in intermediates.items():
+        if isinstance(value, pd.DataFrame):
+            value.to_parquet(out_dir / f"{key}.parquet", index=False)
+        elif isinstance(value, dict):
+            write_json(value, out_dir / f"{key}.json")
+        elif isinstance(value, (list, tuple)):
+            write_json({"values": list(value)}, out_dir / f"{key}.json")

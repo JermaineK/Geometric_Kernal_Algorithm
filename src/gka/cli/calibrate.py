@@ -14,32 +14,42 @@ import yaml
 
 def register(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("calibrate", help="Run synthetic calibration and derive thresholds")
-    parser.add_argument("--suite", default="synthetic", choices=["synthetic"], help="Calibration suite")
-    parser.add_argument("--runs", type=int, default=200, help="Monte Carlo runs per synthetic test")
-    parser.add_argument("--configs", nargs="+", default=["tests/synthetic/configs/*.yaml"], help="Config paths or globs")
-    parser.add_argument("--outroot", default="tests/synthetic/outputs", help="Synthetic output root")
+    parser.add_argument("--suite", default="synthetic", choices=["synthetic", "stress"], help="Calibration suite")
+    parser.add_argument("--runs", type=int, default=200, help="Monte Carlo runs per test")
+    parser.add_argument("--configs", nargs="+", default=None, help="Config paths or globs")
+    parser.add_argument("--outroot", default=None, help="Suite output root")
     parser.add_argument("--seed", type=int, default=12345, help="Suite random seed")
     parser.set_defaults(func=cmd_calibrate)
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    if args.suite != "synthetic":
-        raise ValueError(f"Unsupported suite '{args.suite}'. Only synthetic is currently implemented.")
-
     repo_root = Path(__file__).resolve().parents[3]
-    suite_script = repo_root / "tests" / "synthetic" / "run_synthetic_suite.py"
+    if args.suite == "synthetic":
+        suite_script = repo_root / "tests" / "synthetic" / "run_synthetic_suite.py"
+        default_configs = ["tests/synthetic/configs/*.yaml"]
+        default_outroot = "tests/synthetic/outputs"
+    elif args.suite == "stress":
+        suite_script = repo_root / "tests" / "stress" / "run_stress_suite.py"
+        default_configs = ["tests/stress/configs/*.yaml"]
+        default_outroot = "tests/stress/outputs"
+    else:
+        raise ValueError(f"Unsupported suite '{args.suite}'")
+
     if not suite_script.exists():
-        raise FileNotFoundError(f"Synthetic suite runner not found: {suite_script}")
+        raise FileNotFoundError(f"Suite runner not found: {suite_script}")
+
+    config_args = args.configs if args.configs else default_configs
+    outroot_value = args.outroot if args.outroot else default_outroot
 
     cmd = [
         sys.executable,
         str(suite_script),
         "--configs",
-        *args.configs,
+        *config_args,
         "--runs",
         str(args.runs),
         "--outroot",
-        str(args.outroot),
+        str(outroot_value),
         "--seed",
         str(args.seed),
     ]
@@ -53,7 +63,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
             f"stderr:\n{proc.stderr}"
         )
 
-    outroot = Path(args.outroot)
+    outroot = Path(outroot_value)
     suite_path = outroot / "suite_results.json"
     if not suite_path.exists():
         raise FileNotFoundError(f"Missing suite results at {suite_path}")

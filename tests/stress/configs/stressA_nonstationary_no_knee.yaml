@@ -1,0 +1,60 @@
+name: stressA_nonstationary_no_knee
+domain: synthetic
+n_cases: 72
+L_values:
+  min: 8
+  max: 180
+  n: 24
+  spacing: log
+omega_values: 1.0
+baseline_B:
+  kind: power_law
+  amplitude: 6.0
+  exponent: 0.10
+eta_model:
+  type: power_law
+  A: 0.07
+  L0: 20
+  gamma: 1.3
+noise:
+  distribution: gaussian
+  std: 0.02
+  relative: true
+parity:
+  sign_mode: fixed_per_case
+  label_swap_prob: 0.0
+  pair_break: false
+stress:
+  nonstationary_baseline: true
+  drift_strength: 0.35
+  variance_strength: 0.20
+  temporal_warp: true
+  warp_jitter: 0.45
+  missing_blocks: true
+  missing_block_frac: 0.08
+  missing_random_frac: 0.03
+  duplicate_timestamps: true
+  duplicate_timestamp_frac: 0.20
+  confound_even: true
+  confound_strength: 0.45
+truth:
+  gamma: 1.3
+  knee_L: null
+run:
+  gka_config:
+    knee:
+      method: segmented
+      rho: 1.5
+      min_points: 6
+    scaling:
+      method: wls
+      min_sizes: 4
+      exclude_forbidden: true
+      bootstrap_n: 300
+    impedance:
+      enabled: false
+      tolerance: 0.1
+    nulls:
+      enabled: false
+      n: 0
+      models: []

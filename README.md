@@ -37,6 +37,12 @@ gka validate dataset/
 gka run dataset/ --domain weather --config config.yaml --out results/
 ```
 
+Optional debug artifacts:
+
+```bash
+gka run dataset/ --domain weather --config config.yaml --out results/ --dump-intermediates
+```
+
 4. Create report:
 
 ```bash
@@ -99,6 +105,8 @@ Key invariants include:
 - `gka report`: produce a single HTML report with key plots and tables.
 - `gka diagnose`: run data diagnostics and emit compact operational metrics.
 - `gka calibrate --suite synthetic --runs 200`: run synthetic calibration and suggest threshold settings.
+- `gka calibrate --suite stress --runs 200`: run adversarial stress calibration and suggest thresholds.
+- `gka audit <run_dir>`: explain knee/parity/stability decisions from one run.
 
 ## Development
 

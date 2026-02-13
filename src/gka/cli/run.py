@@ -17,6 +17,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--null", type=int, default=None, help="Override null replication count")
     parser.add_argument("--allow-missing", action="store_true", help="Allow incomplete pairs")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument(
+        "--dump-intermediates",
+        action="store_true",
+        help="Write intermediate diagnostics (series, candidates, scaling points, stability curves)",
+    )
     parser.set_defaults(func=cmd_run)
 
 
@@ -29,6 +34,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         null_n=args.null,
         allow_missing=args.allow_missing,
         seed=args.seed,
+        dump_intermediates=bool(args.dump_intermediates),
         argv=sys.argv,
     )
 

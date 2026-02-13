@@ -1,0 +1,62 @@
+name: stressN_timewarp_knee
+domain: synthetic
+n_cases: 92
+L_values:
+  min: 8
+  max: 220
+  n: 30
+  spacing: log
+omega_values: 1.0
+baseline_B:
+  kind: power_law
+  amplitude: 6.3
+  exponent: 0.1
+eta_model:
+  type: hybrid_knee
+  A: 0.075
+  L0: 20
+  gamma: 1.6
+  xi: 45
+  q: 2.2
+  decay_scale_frac: 0.55
+noise:
+  distribution: student_t
+  std: 0.03
+  df: 2.7
+  burst_prob: 0.03
+  burst_scale: 0.35
+  relative: true
+parity:
+  sign_mode: fixed_per_case
+  label_swap_prob: 0.0
+  pair_break: false
+stress:
+  temporal_warp: true
+  warp_jitter: 0.55
+  missing_blocks: true
+  missing_block_frac: 0.1
+  missing_random_frac: 0.05
+  duplicate_timestamps: true
+  duplicate_timestamp_frac: 0.2
+truth:
+  gamma: 1.6
+  knee_L: 45
+  xi: 45
+run:
+  gka_config:
+    knee:
+      method: segmented
+      rho: 1.5
+      min_points: 6
+    scaling:
+      method: wls
+      min_sizes: 4
+      exclude_forbidden: true
+      bootstrap_n: 300
+    impedance:
+      enabled: false
+      tolerance: 0.1
+    nulls:
+      enabled: false
+      n: 0
+      models: []

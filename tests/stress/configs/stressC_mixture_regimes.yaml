@@ -1,0 +1,65 @@
+name: stressC_mixture_regimes
+domain: synthetic
+n_cases: 88
+L_values:
+  min: 8
+  max: 220
+  n: 30
+  spacing: log
+omega_values: 1.0
+baseline_B:
+  kind: power_law
+  amplitude: 5.8
+  exponent: 0.09
+eta_model:
+  type: dual_hybrid_knee
+  L0: 18
+  A1: 0.07
+  gamma1: 1.5
+  xi1: 24
+  q1: 2.0
+  A2: 0.05
+  gamma2: 1.0
+  xi2: 78
+  q2: 2.4
+noise:
+  distribution: laplace
+  std: 0.018
+  relative: true
+parity:
+  sign_mode: fixed_positive
+  label_swap_prob: 0.0
+  pair_break: false
+stress:
+  nonstationary_baseline: true
+  drift_strength: 0.25
+  variance_strength: 0.18
+  heavy_tail: true
+  heavy_tail_scale: 0.08
+  heavy_tail_df: 3.2
+  temporal_warp: true
+  warp_jitter: 0.30
+truth:
+  gamma: 1.5
+  knee_L: 24
+  band_class: forbidden_middle
+run:
+  gka_config:
+    knee:
+      method: segmented
+      rho: 1.5
+      min_points: 6
+    scaling:
+      method: wls
+      min_sizes: 4
+      exclude_forbidden: true
+      bootstrap_n: 300
+    impedance:
+      enabled: false
+      tolerance: 0.1
+    parity_significance:
+      enabled: false
+    nulls:
+      enabled: false
+      n: 0
+      models: []

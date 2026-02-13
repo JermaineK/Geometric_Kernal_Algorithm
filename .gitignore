@@ -12,5 +12,7 @@ results/
 .tmp/
 tests/synthetic/outputs/*
 !tests/synthetic/outputs/.gitkeep
+tests/stress/outputs/*
+!tests/stress/outputs/.gitkeep
 build/
 dist/

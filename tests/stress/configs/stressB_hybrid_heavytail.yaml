@@ -1,0 +1,66 @@
+name: stressB_hybrid_heavytail
+domain: synthetic
+n_cases: 90
+L_values:
+  min: 8
+  max: 200
+  n: 28
+  spacing: log
+omega_values: 1.0
+baseline_B:
+  kind: power_law
+  amplitude: 6.5
+  exponent: 0.11
+eta_model:
+  type: hybrid_knee
+  A: 0.08
+  L0: 20
+  gamma: 1.8
+  xi: 42
+  q: 2.2
+  decay_scale_frac: 0.45
+noise:
+  distribution: student_t
+  std: 0.02
+  df: 3
+  burst_prob: 0.02
+  burst_scale: 0.35
+  relative: true
+parity:
+  sign_mode: fixed_positive
+  label_swap_prob: 0.0
+  pair_break: false
+stress:
+  heavy_tail: true
+  heavy_tail_scale: 0.10
+  heavy_tail_df: 2.8
+  temporal_warp: true
+  warp_jitter: 0.35
+  missing_blocks: true
+  missing_block_frac: 0.06
+  missing_random_frac: 0.03
+  confound_even: true
+  confound_strength: 0.20
+truth:
+  gamma: 1.8
+  knee_L: 42
+run:
+  gka_config:
+    knee:
+      method: segmented
+      rho: 1.5
+      min_points: 6
+    scaling:
+      method: wls
+      min_sizes: 4
+      exclude_forbidden: true
+      bootstrap_n: 300
+    impedance:
+      enabled: false
+      tolerance: 0.1
+    parity_significance:
+      enabled: false
+    nulls:
+      enabled: false
+      n: 0
+      models: []

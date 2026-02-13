@@ -113,14 +113,19 @@ def parity_significance_pvalues(
     n_perm: int,
     rng: np.random.Generator,
     alpha: float = 0.05,
+    eta_min: float = 0.03,
+    direction_min: float = 0.30,
 ) -> dict[str, float | bool]:
     """Estimate parity significance against permutation and direction-randomization nulls."""
 
     if pair_df.empty:
         return {
             "mirror_stat": 0.0,
+            "obs_dir": 0.0,
             "p_perm": 1.0,
             "p_dir": 1.0,
+            "mirror_pass": False,
+            "direction_pass": False,
             "signal_pass": False,
         }
 
@@ -151,11 +156,16 @@ def parity_significance_pvalues(
     obs_dir = float(np.abs(np.mean(np.sign(_pair_signed(left_vals, right_vals)))))
     p_perm = float((np.sum(perm_stats >= mirror_stat) + 1) / (n_perm + 1))
     p_dir = float((np.sum(dir_stats >= obs_dir) + 1) / (n_perm + 1))
-    signal_pass = bool(p_perm < alpha)
+    mirror_pass = bool(p_perm < alpha and mirror_stat >= eta_min)
+    direction_pass = bool(p_dir < alpha and obs_dir >= direction_min)
+    signal_pass = bool(mirror_pass or direction_pass)
     return {
         "mirror_stat": mirror_stat,
+        "obs_dir": obs_dir,
         "p_perm": p_perm,
         "p_dir": p_dir,
+        "mirror_pass": mirror_pass,
+        "direction_pass": direction_pass,
         "signal_pass": signal_pass,
     }
 
