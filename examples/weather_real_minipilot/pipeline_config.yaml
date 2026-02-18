@@ -1,0 +1,36 @@
+knee:
+  method: segmented
+  rho: 1.5
+  min_points: 4
+  min_points_each_side: 2
+  bic_delta_min: 10.0
+  knee_p_min: 0.35
+  knee_strength_min: 0.5
+  curvature_peak_ratio_min: 1.1
+  curvature_alignment_min: 0.5
+  middle_score_threshold: 0.6
+scaling:
+  method: wls
+  robust: true
+  huber_delta: 1.5
+  min_sizes: 4
+  exclude_forbidden: true
+  bootstrap_n: 500
+stability:
+  b: 2.0
+  marginal_eps: 0.1
+stability_score:
+  eps_log: 0.2
+impedance:
+  enabled: true
+  tolerance: 0.15
+parity_significance:
+  enabled: true
+  n_perm: 200
+  alpha: 0.05
+  eta_min: 0.03
+  direction_min: 0.30
+nulls:
+  enabled: true
+  n: 100
+  models: [time_shuffle, mirror_swap, phase_scramble, block_bootstrap]
