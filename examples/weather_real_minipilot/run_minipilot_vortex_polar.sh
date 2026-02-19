@@ -2,22 +2,17 @@
 set -euo pipefail
 
 RAW_PATH="${1:-data/raw/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet}"
-PREPARED_ROOT="${2:-data/prepared/weather_v1}"
-TILES_DATASET="${3:-data/tiles/weather_real_v1}"
-RESULTS_DIR="${4:-results/weather_real_minipilot}"
-SPLIT_DATE="${5:-2025-04-01}"
-BUFFER_HOURS="${6:-72}"
-IBTRACS_PATH="${7:-}"
+IBTRACS_PATH="${2:-C:/Weather warning project/data/tracks/ibtracs.ALL.list.v04r01.csv}"
+PREPARED_ROOT="${3:-data/prepared/weather_v1}"
+TILES_DATASET="${4:-data/tiles/weather_real_vnext}"
+RESULTS_DIR="${5:-results/weather_real_vnext}"
+SPLIT_DATE="${6:-2025-02-08}"
+BUFFER_HOURS="${7:-72}"
 
 python examples/weather_real_minipilot/prepare_weather_v1.py \
   --input "${RAW_PATH}" \
   --out "${PREPARED_ROOT}" \
   --lon0-sweep 145 150 155 160
-
-IBTRACS_ARGS=()
-if [[ -n "${IBTRACS_PATH}" ]]; then
-  IBTRACS_ARGS+=(--ibtracs-csv "${IBTRACS_PATH}")
-fi
 
 python examples/weather_real_minipilot/build_tiles.py \
   --prepared-root "${PREPARED_ROOT}" \
@@ -25,11 +20,15 @@ python examples/weather_real_minipilot/build_tiles.py \
   --cohort all \
   --centers hybrid \
   --ibtracs-csv "${IBTRACS_PATH}" \
+  --ibtracs-out-dir data/external \
   --distance-time-tolerance-hours 3.0 \
+  --distance-event-km 300 \
+  --distance-near-km 800 \
+  --distance-far-km 1500 \
   --scan-batch-rows 120000 \
   --background-pool-max-rows 300000 \
-  --background-max-batches-per-lead 0 \
-  --vortex-max-fragments-per-lead 0 \
+  --background-max-batches-per-lead 200 \
+  --vortex-max-fragments-per-lead 200 \
   --control-mode matched_background \
   --allow-nonexact-controls \
   --require-physical-match \
@@ -52,9 +51,9 @@ python examples/weather_real_minipilot/build_tiles.py \
   --min-controls-per-lead-bucket 2 \
   --min-far-nonstorm-per-lead-bucket 2 \
   --adaptive-control-coverage \
-  --lead-buckets 24 120 240 none \
-  --max-events-per-lead 12 \
-  "${IBTRACS_ARGS[@]}"
+  --lead-buckets 24 48 72 120 240 none \
+  --max-events-per-lead 16 \
+  --seed 42
 
 gka validate "${TILES_DATASET}"
 
@@ -82,7 +81,7 @@ python examples/weather_real_minipilot/evaluate_minipilot.py \
   --axis-sensitivity-json "${PREPARED_ROOT}/lon0_sensitivity.json" \
   --axis-std-threshold 0.02 \
   --parity-claim-mode auto \
-  --parity-confound-max-ratio 0.6 \
+  --parity-confound-max-ratio 0.55 \
   --parity-event-minus-far-min 0.15 \
   --parity-far-max 0.35 \
   --anomaly-agreement-mean-min 0.85 \

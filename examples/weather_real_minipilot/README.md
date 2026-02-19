@@ -8,10 +8,11 @@ This example turns the 70M-row weather parquet into a lead-aware, mirror-aware, 
    - `data/prepared/weather_v1/lead=<bucket>/date=<YYYY-MM-DD>/part-*.parquet`
    - `data/prepared/weather_v1/mirror_audit.json`
    - `data/prepared/weather_v1/lon0_sensitivity.json` (optional, when `--lon0-sweep` is set)
-2. Discover event centers via vortex detection + tracking (or fallback labels):
+2. Discover event centers via IBTrACS/vortex/hybrid/labels:
    - candidates from vorticity + Okubo-Weiss
    - tracked into storm-like paths and converted to `case_id`
    - outputs: `vortex_candidates.parquet`, `storm_tracks.parquet`
+   - optional IBTrACS catalogs: `data/external/ibtracs_au_2025_FMA.parquet` and `data/external/ibtracs_au_2025_FMA_hourly.parquet`
 3. Derive mirror channels about longitude `150.0`:
    - vector transform after reflection: `u -> -u`, `v -> v`
 4. Add parity channels:
@@ -23,7 +24,8 @@ This example turns the 70M-row weather parquet into a lead-aware, mirror-aware, 
    - optional `data/tiles/weather_real_v1/ibtracs_match.json` when `--ibtracs-csv` is provided
    - supports `--cohort all|events|background`
    - supports `--anomaly-mode lat_hour|lat_day|none` to remove mean-flow before parity aggregation
-   - supports `--event-source vortex_or_labels|vortex|labels|ibtracs`
+   - supports `--centers ibtracs|vortex|hybrid|labels` (`--event-source` kept as legacy alias)
+   - supports distance-to-track labeling from IBTrACS (`event/near_storm/far_nonstorm` cohorts)
    - supports storm-centered polar diagnostics via `--polar-enable`
    - supports matched-background control mode (`--control-mode matched_background`)
    - uses pyarrow streaming controls for large corpora:
@@ -36,6 +38,8 @@ This example turns the 70M-row weather parquet into a lead-aware, mirror-aware, 
 
 ```bash
 bash examples/weather_real_minipilot/run_minipilot.sh
+# or IBTrACS + vortex + polar vNext
+bash examples/weather_real_minipilot/run_minipilot_vortex_polar.sh
 ```
 
 Or run stepwise:
@@ -52,7 +56,8 @@ python examples/weather_real_minipilot/build_tiles.py \
   --prepared-root data/prepared/weather_v1 \
   --out data/tiles/weather_real_v1 \
   --cohort all \
-  --event-source vortex_or_labels \
+  --centers hybrid \
+  --ibtracs-csv "C:/Weather warning project/data/tracks/ibtracs.ALL.list.v04r01.csv" \
   --control-mode matched_background \
   --polar-enable \
   --anomaly-mode lat_hour \
@@ -93,6 +98,9 @@ python examples/weather_real_minipilot/evaluate_minipilot.py \
   - fake mirror pairing (wrong mirror pairing surrogate)
   - latitude mirror pairing null
   - circular lon-shift pairing null
+  - polar theta-roll null
+  - polar radial-shuffle null
+  - center-jitter null
 - stratified evaluation slices:
   - `all`
   - `events`
