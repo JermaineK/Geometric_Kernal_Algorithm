@@ -214,3 +214,10 @@ tests:
       xi_abs_pct_err_p90_max: 0.65
       xi_abs_pct_err_cat_rate_max: 0.3
       band_class_accuracy_min: 0.6
+
+  stressO_borderline_forbidden:
+    kind: logistic_fake_knee
+    required: true
+    false_knee_rate_max: 0.30
+    coherent_rate_max: 0.95
+    forbidden_middle_rate_max: 0.70

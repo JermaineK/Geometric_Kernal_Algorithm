@@ -14,6 +14,7 @@ from gka.core.registry import get_adapter
 from gka.core.types import DatasetBundle, PipelineResult
 from gka.core.versioning import git_commit_hash, invocation_string, package_versions
 from gka.data.io import load_dataset_spec, write_json
+from gka.metrics.eigen_stability import estimate_eigen_stability
 from gka.data.validators import report_to_dict, validate_dataset
 from gka.metrics.forbidden_middle import compute_forbidden_middle_score
 from gka.ops.coherence import compute_coherence_metrics
@@ -30,7 +31,7 @@ from gka.ops.scaling import fit_scaling
 from gka.ops.spectrum import extract_ticks
 from gka.ops.stability import classify_stability
 from gka.stats.null_models import apply_null_model, parity_significance_pvalues
-from gka.utils.hash import dataset_hash
+from gka.utils.hash import dataset_hash, mapping_sha256
 from gka.utils.safe_math import safe_log
 from gka.utils.time import utc_now_iso
 
@@ -109,6 +110,7 @@ def run_pipeline(
         "git_commit": git_commit_hash(Path.cwd()),
         "package_versions": package_versions(),
         "dataset_hash": dataset_hash(dataset_root),
+        "config_hash": mapping_sha256(resolved),
         "random_seed": int(resolved.get("seed", 42)),
         "cli_invocation": invocation_string(argv or []),
         "dataset_path": str(dataset_root.resolve()),
@@ -182,6 +184,13 @@ def _run_core(
         bootstrap_n=int(cfg["scaling"].get("bootstrap_n", 1000)),
         rng=rng,
     )
+    eigen = estimate_eigen_stability(
+        gamma=scaling.gamma,
+        b=float(cfg["stability"]["b"]),
+        margin_eps=float(cfg["stability"].get("marginal_eps", 0.1)),
+        gamma_ci=scaling.ci,
+        evidence="size_law_gamma",
+    )
 
     stability = classify_stability(
         gamma=scaling.gamma,
@@ -232,6 +241,7 @@ def _run_core(
         delta_gamma=knee.delta_gamma,
         slope_drift=float(scaling.drift),
         ridge_strength=float(ticks.ridge_strength),
+        bootstrap_cov=knee.bootstrap_cov,
         threshold=float(cfg["knee"].get("middle_score_threshold", 0.6)),
     )
 
@@ -321,8 +331,14 @@ def _run_core(
     out["knee_post_slope_std"] = _nan_or_value(knee.post_slope_std)
     out["knee_curvature_peak_ratio"] = _nan_or_value(knee.curvature_peak_ratio)
     out["knee_curvature_alignment"] = _nan_or_value(knee.curvature_alignment)
+    out["knee_candidate_count_proposed"] = int(knee.candidate_count_proposed)
+    out["knee_candidate_count_evaluated"] = int(knee.candidate_count_evaluated)
+    out["knee_candidate_count_sanity_pass"] = int(knee.candidate_count_sanity_pass)
     out["middle_score"] = _nan_or_value(middle.score)
     out["middle_label"] = middle.label
+    out["forbidden_middle_width"] = _nan_or_value(middle.width)
+    out["forbidden_middle_center"] = _nan_or_value(middle.center)
+    out["forbidden_middle_reason_codes"] = ";".join(middle.reason_codes)
     out["knee_delta_bic"] = knee.delta_bic
     out["knee_bic_no_knee"] = knee.bic_no_knee
     out["knee_bic_knee"] = knee.bic_knee
@@ -340,6 +356,10 @@ def _run_core(
     out["stability_class"] = stability.stability_class
     out["lambda_eff"] = stability.lambda_eff
     out["ineq_pass"] = stability.ineq_pass
+    out["eigen_band"] = eigen.eigen_band
+    out["stability_margin"] = eigen.stability_margin
+    out["eigen_confidence"] = eigen.confidence
+    out["eigen_evidence"] = eigen.eigen_evidence
     out["impedance_ratio"] = imp.ratio
     out["impedance_pass"] = imp.passed
     out["A"] = coherence.A
@@ -377,8 +397,14 @@ def _run_core(
         "knee_post_slope_std": knee.post_slope_std,
         "knee_curvature_peak_ratio": knee.curvature_peak_ratio,
         "knee_curvature_alignment": knee.curvature_alignment,
+        "knee_candidate_count_proposed": int(knee.candidate_count_proposed),
+        "knee_candidate_count_evaluated": int(knee.candidate_count_evaluated),
+        "knee_candidate_count_sanity_pass": int(knee.candidate_count_sanity_pass),
         "middle_score": middle.score,
         "middle_label": middle.label,
+        "forbidden_middle_width": middle.width,
+        "forbidden_middle_center": middle.center,
+        "forbidden_middle_reason_codes": middle.reason_codes,
         "parity_p_perm": float(parity_sig["p_perm"]),
         "parity_p_dir": float(parity_sig["p_dir"]),
         "parity_obs_dir": float(parity_sig["obs_dir"]),
@@ -388,6 +414,8 @@ def _run_core(
         "S_curve_values": sdiag.S_curve_values.tolist(),
         "predicted_bands": predicted.tolist(),
         "band_hit_rate": float(hit_rate),
+        "eigen_band": eigen.eigen_band,
+        "stability_margin": eigen.stability_margin,
     }
     scaling_points = _build_scaling_points(
         per_size=per_size,
@@ -419,6 +447,9 @@ def _run_core(
             "delta_gamma": knee.delta_gamma,
             "resid_improvement": knee.resid_improvement,
             "rejection_reasons": knee.rejection_reasons,
+            "candidate_count_proposed": int(knee.candidate_count_proposed),
+            "candidate_count_evaluated": int(knee.candidate_count_evaluated),
+            "candidate_count_sanity_pass": int(knee.candidate_count_sanity_pass),
         },
         "spectrum_candidates": {
             "Omega_candidates": ticks.Omega_candidates.tolist(),
@@ -437,6 +468,9 @@ def _run_core(
             "score": middle.score,
             "label": middle.label,
             "components": middle.components,
+            "reason_codes": middle.reason_codes,
+            "width": middle.width,
+            "center": middle.center,
         },
     }
     return out, stage_context, intermediates

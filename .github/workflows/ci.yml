@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  test-and-stress:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Unit Tests
+        run: make test
+      - name: Stress Gate (fast)
+        run: make stress
+      - name: Validate stress outputs
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          out = Path("tests/stress/outputs/ci")
+          suite_path = out / "suite_results.json"
+          gate_path = out / "robustness_gate.json"
+          if not suite_path.exists():
+              raise SystemExit(f"Missing suite results: {suite_path}")
+          if not gate_path.exists():
+              raise SystemExit(f"Missing robustness gate: {gate_path}")
+
+          suite = json.loads(suite_path.read_text(encoding="utf-8"))
+          if not bool(suite.get("passed", False)):
+              raise SystemExit("Stress suite did not pass")
+
+          gate = json.loads(gate_path.read_text(encoding="utf-8"))
+          for key in ("schema_version", "enabled", "passed", "checks"):
+              if key not in gate:
+                  raise SystemExit(f"robustness_gate missing key: {key}")
+          if not isinstance(gate["checks"], list) or not gate["checks"]:
+              raise SystemExit("robustness_gate.checks must be a non-empty list")
+          for idx, chk in enumerate(gate["checks"]):
+              for key in ("name", "op", "value", "threshold", "pass"):
+                  if key not in chk:
+                      raise SystemExit(f"robustness_gate.checks[{idx}] missing key: {key}")
+          if not bool(gate.get("passed", False)):
+              raise SystemExit("robustness_gate did not pass")
+          PY
+
+  stress-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Unit Tests
+        run: make test
+      - name: Stress Gate (nightly)
+        run: make stress-nightly

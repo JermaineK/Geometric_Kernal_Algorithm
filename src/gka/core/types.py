@@ -114,6 +114,9 @@ class KneeOutputs:
     post_slope_std: float | None = None
     curvature_peak_ratio: float | None = None
     curvature_alignment: float | None = None
+    candidate_count_proposed: int = 0
+    candidate_count_evaluated: int = 0
+    candidate_count_sanity_pass: int = 0
 
 
 @dataclass(frozen=True)

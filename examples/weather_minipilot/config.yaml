@@ -1,0 +1,24 @@
+knee:
+  method: segmented
+  min_points: 6
+  bic_delta_min: 10.0
+  knee_p_min: 0.35
+  knee_strength_min: 0.5
+  curvature_peak_ratio_min: 1.1
+  curvature_alignment_min: 0.5
+scaling:
+  method: wls
+  robust: true
+  huber_delta: 1.5
+  min_sizes: 4
+  exclude_forbidden: true
+stability:
+  b: 2.0
+  marginal_eps: 0.1
+impedance:
+  enabled: true
+  tolerance: 0.15
+nulls:
+  enabled: true
+  n: 50
+  models: [time_shuffle, mirror_swap, phase_scramble, block_bootstrap]

@@ -49,6 +49,12 @@ gka run dataset/ --domain weather --config config.yaml --out results/ --dump-int
 gka report --in results/ --out results/report.html
 ```
 
+This writes:
+- `report.html`
+- `report.json`
+- `report.md`
+- `figures/` (knee + eta plots)
+
 ## Canonical dataset format
 
 A dataset folder must contain:
@@ -104,13 +110,22 @@ Key invariants include:
 - `gka run`: execute the full deterministic pipeline.
 - `gka report`: produce a single HTML report with key plots and tables.
 - `gka diagnose`: run data diagnostics and emit compact operational metrics.
-- `gka calibrate --suite synthetic --runs 200`: run synthetic calibration and suggest threshold settings.
-- `gka calibrate --suite stress --runs 200`: run adversarial stress calibration and suggest thresholds.
+- `gka calibrate --suite stress --runs 200`: fit frozen thresholds and write `calibration.json`.
+- `gka score --parameter-runs ... --calibration ...`: score with frozen thresholds only.
 - `gka audit <run_dir>`: explain knee/parity/stability decisions from one run.
 
 ## Development
 
 ```bash
 pip install -e .[dev]
-pytest
+make test
+make stress
 ```
+
+## Real Weather Minipilot
+
+See `examples/weather_real_minipilot/README.md` for:
+- row-group streamed weather preparation (`lead/date` partitioning),
+- longitude-mirror parity channel construction,
+- storm-centered tile dataset generation,
+- blocked-split evaluation with null controls.

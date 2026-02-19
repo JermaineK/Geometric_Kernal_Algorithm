@@ -7,16 +7,27 @@ TILES_DATASET="${3:-data/tiles/weather_real_v1}"
 RESULTS_DIR="${4:-results/weather_real_minipilot}"
 SPLIT_DATE="${5:-2025-04-01}"
 BUFFER_HOURS="${6:-72}"
+IBTRACS_PATH="${7:-}"
 
 python examples/weather_real_minipilot/prepare_weather_v1.py \
   --input "${RAW_PATH}" \
   --out "${PREPARED_ROOT}" \
   --lon0-sweep 145 150 155 160
 
+IBTRACS_ARGS=()
+if [[ -n "${IBTRACS_PATH}" ]]; then
+  IBTRACS_ARGS+=(--ibtracs-csv "${IBTRACS_PATH}")
+fi
+
 python examples/weather_real_minipilot/build_tiles.py \
   --prepared-root "${PREPARED_ROOT}" \
   --out "${TILES_DATASET}" \
   --cohort all \
+  --event-source vortex_or_labels \
+  --scan-batch-rows 120000 \
+  --background-pool-max-rows 300000 \
+  --background-max-batches-per-lead 0 \
+  --vortex-max-fragments-per-lead 0 \
   --control-mode matched_background \
   --allow-nonexact-controls \
   --require-physical-match \
@@ -31,11 +42,16 @@ python examples/weather_real_minipilot/build_tiles.py \
   --anomaly-commute-corr-min 0.05 \
   --anomaly-min-bin-samples 24 \
   --anomaly-min-covered-frac 0.70 \
+  --polar-enable \
+  --polar-r-bins 64 \
+  --polar-theta-bins 128 \
+  --polar-pitches -1.5 -1.0 -0.7 0.7 1.0 1.5 \
   --min-distinct-scales-per-case 4 \
   --min-controls-per-lead-bucket 2 \
   --min-far-nonstorm-per-lead-bucket 1 \
   --lead-buckets 24 120 240 none \
-  --max-events-per-lead 12
+  --max-events-per-lead 12 \
+  "${IBTRACS_ARGS[@]}"
 
 gka validate "${TILES_DATASET}"
 

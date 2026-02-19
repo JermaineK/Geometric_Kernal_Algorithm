@@ -28,6 +28,10 @@ MODE_TO_COLUMN: dict[str, str | None] = {
     "meanflow_removed": "O_meanflow",
     "anomaly_lat_hour": "O_lat_hour",
     "anomaly_lat_day": "O_lat_day",
+    "polar_spiral": "O_polar_spiral",
+    "polar_chiral": "O_polar_chiral",
+    "polar_left": "O_polar_left",
+    "polar_right": "O_polar_right",
 }
 
 
@@ -109,6 +113,10 @@ def parse_args() -> argparse.Namespace:
             "meanflow_removed",
             "anomaly_lat_hour",
             "anomaly_lat_day",
+            "polar_spiral",
+            "polar_chiral",
+            "polar_left",
+            "polar_right",
         ],
         default="auto",
         help="Parity observable mode used for final claim metrics (auto uses ablations + gates)",
@@ -400,7 +408,17 @@ def main() -> int:
 
     knee_candidate_table = _build_knee_candidate_table(
         samples=test_df,
-        modes=["current", "raw", "anomaly_lat_hour", "anomaly_lat_day", "scalars_only", "local_frame", "vorticity"],
+        modes=[
+            "current",
+            "raw",
+            "anomaly_lat_hour",
+            "anomaly_lat_day",
+            "scalars_only",
+            "local_frame",
+            "vorticity",
+            "polar_spiral",
+            "polar_chiral",
+        ],
     )
     summary["knee_candidate_table_summary"] = {
         "n_rows": int(knee_candidate_table.shape[0]),
@@ -1737,6 +1755,10 @@ def _build_parity_ablation_report(
         "meanflow_removed": "O_meanflow",
         "anomaly_lat_hour": "O_lat_hour",
         "anomaly_lat_day": "O_lat_day",
+        "polar_spiral": "O_polar_spiral",
+        "polar_chiral": "O_polar_chiral",
+        "polar_left": "O_polar_left",
+        "polar_right": "O_polar_right",
     }
     out: dict[str, Any] = {
         "axis_robust_applied": bool(axis_robust),
@@ -1976,6 +1998,8 @@ def _build_parity_confound_dashboard(
                 "mean_abs_O_raw": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_raw"), errors="coerce").to_numpy(dtype=float)))),
                 "mean_abs_O_vorticity": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_vorticity"), errors="coerce").to_numpy(dtype=float)))),
                 "mean_abs_O_local_frame": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_local_frame"), errors="coerce").to_numpy(dtype=float)))),
+                "mean_abs_O_polar_spiral": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_polar_spiral"), errors="coerce").to_numpy(dtype=float)))),
+                "mean_abs_O_polar_chiral": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_polar_chiral"), errors="coerce").to_numpy(dtype=float)))),
                 "mirror_ks_stat_O": ks_stat,
                 "mirror_ks_pvalue_O": ks_p,
                 "axis_robust": bool(axis_meta.get("axis_robust", False)),

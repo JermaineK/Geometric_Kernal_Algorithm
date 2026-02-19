@@ -98,6 +98,9 @@ def detect_knee(
             knee_ci=knee_ci,
             knee_cov=knee_cov,
             post_slope_std=post_slope_std,
+            candidate_count_proposed=int(posterior.candidate_count_proposed),
+            candidate_count_evaluated=int(posterior.candidate_count_evaluated),
+            candidate_count_sanity_pass=int(posterior.candidate_count_sanity_pass),
         )
 
     reasons: list[str] = list(candidate.reasons)
@@ -168,6 +171,9 @@ def detect_knee(
         post_slope_std=post_slope_std,
         curvature_peak_ratio=float(candidate.curvature_peak_ratio),
         curvature_alignment=float(candidate.curvature_alignment),
+        candidate_count_proposed=int(posterior.candidate_count_proposed),
+        candidate_count_evaluated=int(posterior.candidate_count_evaluated),
+        candidate_count_sanity_pass=int(posterior.candidate_count_sanity_pass),
     )
 
 
@@ -316,6 +322,9 @@ def _no_knee_output(
     knee_ci: tuple[float | None, float | None],
     knee_cov: float | None,
     post_slope_std: float | None,
+    candidate_count_proposed: int,
+    candidate_count_evaluated: int,
+    candidate_count_sanity_pass: int,
 ) -> KneeOutputs:
     band: tuple[float | None, float | None]
     if forbidden is None:
@@ -349,4 +358,7 @@ def _no_knee_output(
         post_slope_std=post_slope_std,
         curvature_peak_ratio=None,
         curvature_alignment=None,
+        candidate_count_proposed=int(candidate_count_proposed),
+        candidate_count_evaluated=int(candidate_count_evaluated),
+        candidate_count_sanity_pass=int(candidate_count_sanity_pass),
     )

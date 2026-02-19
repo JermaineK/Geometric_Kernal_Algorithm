@@ -56,6 +56,11 @@ def generate_html_report(results_dir: Path, out_html: Path) -> None:
         "M_Z",
         "band_hit_rate",
         "band_class_hat",
+        "eigen_band",
+        "stability_margin",
+        "forbidden_middle_width",
+        "forbidden_middle_center",
+        "forbidden_middle_reason_codes",
         "knee_rejected_because",
     ]
     present = [c for c in diag_cols if c in results_df.columns]

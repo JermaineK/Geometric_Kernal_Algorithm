@@ -30,7 +30,7 @@ This command now also writes `robustness_report.json` by default, including:
 - parameter robustness sweep (noise, L samples, slope, xi, tau_s)
 - blind synthetic regime classification (default `n=100`)
 - invariant stability map over `(gamma, xi/L, tau_s, impedance_ratio)`
-- calibrated threshold recommendation at `tests/stress/expected/calibration.yaml`
+- calibrated threshold recommendation at `tests/stress/outputs/calibration.json`
 
 ## Outputs
 
@@ -57,6 +57,7 @@ Additional stress configs:
 - `stressL_low_contrast_real_knee`: real but low-contrast knees (recall stressor).
 - `stressM_multiknee`: dual-knee mixture with broadened transition.
 - `stressN_timewarp_knee`: true knee under strong temporal warping/missingness.
+- `stressO_borderline_forbidden`: borderline logistic transition guard against over-triggering forbidden-middle.
 
 ## Interpretation
 

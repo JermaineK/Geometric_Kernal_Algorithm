@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-02-13T22:10:07.410724+00:00",
+  "objective": {
+    "beta": 1.0,
+    "false_positive_rate_max": 0.1
+  },
+  "schema_version": 1,
+  "source": {
+    "n_rows": 20,
+    "parameter_runs_path": "C:\\GKA\\Geometric_Kernal_Algorithm\\tests\\stress\\outputs\\robustness\\parameter_sweep\\parameter_runs.json",
+    "parameter_runs_sha256": "7fa17cf2a99938ca8cd0124bfb50f3935bd1d512de68aee85e4cf4e2569ffd6e"
+  },
+  "thresholds": {
+    "knee_delta_bic_min": 0.0,
+    "knee_p_min": 0.014000000000000004,
+    "knee_strength_min": 0.0,
+    "middle_score_band": {
+      "forbidden_min": 0.45
+    }
+  }
+}

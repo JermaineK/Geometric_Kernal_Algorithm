@@ -17,6 +17,9 @@ class KneePosterior:
     knee_samples: np.ndarray
     post_slope_samples: np.ndarray
     accepted_fraction: float
+    candidate_count_proposed: int
+    candidate_count_evaluated: int
+    candidate_count_sanity_pass: int
 
 
 def estimate_knee_posterior(
@@ -47,6 +50,9 @@ def estimate_knee_posterior(
             knee_samples=np.array([], dtype=float),
             post_slope_samples=np.array([], dtype=float),
             accepted_fraction=0.0,
+            candidate_count_proposed=0,
+            candidate_count_evaluated=0,
+            candidate_count_sanity_pass=0,
         )
 
     rss0 = _linear_rss(x, y)
@@ -73,6 +79,7 @@ def estimate_knee_posterior(
         curvature_alignment_min=curvature_alignment_min,
     )
     best_candidate = _choose_best(evaluated, bic_delta_min=bic_delta_min, knee_strength_min=knee_strength_min)
+    sanity_pass = int(sum(1 for c in evaluated if c.sanity_ok))
 
     boot_samples: list[float] = []
     boot_post_slopes: list[float] = []
@@ -135,6 +142,9 @@ def estimate_knee_posterior(
             knee_samples=np.array([], dtype=float),
             post_slope_samples=np.array([], dtype=float),
             accepted_fraction=0.0,
+            candidate_count_proposed=int(len(proposed)),
+            candidate_count_evaluated=int(len(evaluated)),
+            candidate_count_sanity_pass=int(sanity_pass),
         )
 
     knee_probability = float(samples.size / boot_valid)
@@ -152,6 +162,9 @@ def estimate_knee_posterior(
         knee_samples=samples,
         post_slope_samples=np.asarray(boot_post_slopes, dtype=float),
         accepted_fraction=float(samples.size / max(int(n_boot), 1)),
+        candidate_count_proposed=int(len(proposed)),
+        candidate_count_evaluated=int(len(evaluated)),
+        candidate_count_sanity_pass=int(sanity_pass),
     )
 
 

@@ -59,7 +59,9 @@ def cmd_audit(args: argparse.Namespace) -> int:
         f"gamma={payload['stability']['gamma']:.6g} "
         f"Delta_b={payload['stability']['Delta_b']:.6g} "
         f"S_at_mu_k={payload['stability']['S_at_mu_k']:.6g} "
-        f"band={payload['stability']['band_class']}"
+        f"band={payload['stability']['band_class']} "
+        f"eigen={payload['stability']['eigen_band']} "
+        f"margin={payload['stability']['stability_margin']:.6g}"
     )
     return 0
 
@@ -112,5 +114,7 @@ def _build_audit_payload(row: pd.Series, metadata: dict[str, Any]) -> dict[str, 
             "W_mu": _as_float(row, "W_mu", float("nan")),
             "band_class": str(row.get("band_class_hat", "unknown")),
             "class": str(row.get("stability_class", "unknown")),
+            "eigen_band": str(row.get("eigen_band", "unknown")),
+            "stability_margin": _as_float(row, "stability_margin", float("nan")),
         },
     }

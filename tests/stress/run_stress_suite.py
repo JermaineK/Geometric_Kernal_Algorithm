@@ -13,7 +13,11 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from gka.calibrate.fit_thresholds import fit_thresholds_from_robustness, write_threshold_yaml
+from gka.calibration.schema import (
+    ROBUSTNESS_GATE_SCHEMA_VERSION,
+    validate_robustness_gate_payload,
+)
+from gka.calibration.fit import fit_calibration_from_parameter_runs, write_calibration
 from gka.classify.blind_model import (
     InvariantBlindClassifier,
     expected_calibration_error,
@@ -112,6 +116,7 @@ def main() -> int:
             report=report,
             expectations_path=Path(ns.expectations),
         )
+        robust_eval = validate_robustness_gate_payload(robust_eval)
         overall_pass = overall_pass and bool(robust_eval["passed"])
         robust_eval_path = Path(ns.outroot) / "robustness_gate.json"
         robust_eval_path.write_text(json.dumps(robust_eval, indent=2, sort_keys=True), encoding="utf-8")
@@ -156,21 +161,13 @@ def build_robustness_report(
     )
     stability_map = _build_invariant_stability_map(epsilon=0.2)
     param_runs_path = Path(param_report["runs_path"])
-    param_runs_df = pd.read_json(param_runs_path)
-    threshold_payload = fit_thresholds_from_robustness(
-        parameter_runs=param_runs_df,
+    calibration_payload = fit_calibration_from_parameter_runs(
+        parameter_runs_path=param_runs_path,
         target_fp_max=float(global_expect.get("robustness", {}).get("false_positive_rate_max", 0.10)),
         objective_beta=1.0,
     )
-    calibration_path = expectations_path.parent / "calibration.yaml"
-    write_threshold_yaml(
-        {
-            "generated_at": datetime.now(tz=timezone.utc).isoformat(),
-            "source": str(param_runs_path),
-            "thresholds": threshold_payload,
-        },
-        calibration_path,
-    )
+    calibration_path = outroot / "calibration.json"
+    write_calibration(calibration_payload, calibration_path)
 
     return {
         "timestamp_utc": datetime.now(tz=timezone.utc).isoformat(),
@@ -178,7 +175,7 @@ def build_robustness_report(
         "parameter_robustness": param_report,
         "blind_test": blind_report,
         "invariant_stability_map": stability_map,
-        "recommended_thresholds": threshold_payload,
+        "recommended_thresholds": calibration_payload["thresholds"],
         "recommended_thresholds_path": str(calibration_path),
     }
 
@@ -650,7 +647,20 @@ def evaluate_robustness_gates(
 ) -> dict[str, Any]:
     robust_cfg = _load_global_expect(expectations_path).get("robustness", {})
     if not isinstance(robust_cfg, dict) or not robust_cfg:
-        return {"enabled": False, "passed": True, "checks": []}
+        return {
+            "schema_version": ROBUSTNESS_GATE_SCHEMA_VERSION,
+            "enabled": False,
+            "passed": True,
+            "checks": [
+                {
+                    "name": "robustness_disabled",
+                    "value": 1.0,
+                    "op": ">=",
+                    "threshold": 1.0,
+                    "pass": True,
+                }
+            ],
+        }
 
     param = report.get("parameter_robustness", {})
     blind = report.get("blind_test", {})
@@ -699,7 +709,12 @@ def evaluate_robustness_gates(
     )
 
     passed = all(bool(c.get("pass", False)) for c in checks)
-    return {"enabled": True, "passed": passed, "checks": checks}
+    return {
+        "schema_version": ROBUSTNESS_GATE_SCHEMA_VERSION,
+        "enabled": True,
+        "passed": passed,
+        "checks": checks,
+    }
 
 
 def _load_global_expect(path: Path) -> dict[str, Any]:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from gka.cli import audit, calibrate, diagnose, prepare, report, run, schema, validate
+from gka.cli import audit, calibrate, diagnose, prepare, report, run, schema, score, validate
 from gka.core.logging import setup_logging
 from gka.domains import register_builtin_adapters
 
@@ -20,6 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     report.register(subparsers)
     diagnose.register(subparsers)
     calibrate.register(subparsers)
+    score.register(subparsers)
     audit.register(subparsers)
     schema.register(subparsers)
 

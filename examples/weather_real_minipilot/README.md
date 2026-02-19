@@ -1,6 +1,6 @@
 # Weather Real Minipilot
 
-This example turns the 70M-row weather parquet into a lead-aware, mirror-aware GKA workflow.
+This example turns the 70M-row weather parquet into a lead-aware, mirror-aware, vortex-centered GKA workflow.
 
 ## What it does
 
@@ -8,17 +8,29 @@ This example turns the 70M-row weather parquet into a lead-aware, mirror-aware G
    - `data/prepared/weather_v1/lead=<bucket>/date=<YYYY-MM-DD>/part-*.parquet`
    - `data/prepared/weather_v1/mirror_audit.json`
    - `data/prepared/weather_v1/lon0_sensitivity.json` (optional, when `--lon0-sweep` is set)
-2. Derive mirror channels about longitude `150.0`:
+2. Discover event centers via vortex detection + tracking (or fallback labels):
+   - candidates from vorticity + Okubo-Weiss
+   - tracked into storm-like paths and converted to `case_id`
+   - outputs: `vortex_candidates.parquet`, `storm_tracks.parquet`
+3. Derive mirror channels about longitude `150.0`:
    - vector transform after reflection: `u -> -u`, `v -> v`
-3. Add parity channels:
+4. Add parity channels:
    - `u_even/u_odd`, `v_even/v_odd`, `eta_parity`
-4. Build storm-centered tile aggregates into canonical GKA dataset:
+5. Build storm-centered tile aggregates into canonical GKA dataset:
    - `data/tiles/weather_real_v1/dataset.yaml`
    - `data/tiles/weather_real_v1/samples.parquet`
+   - `data/tiles/weather_real_v1/polar_features.parquet`
+   - optional `data/tiles/weather_real_v1/ibtracs_match.json` when `--ibtracs-csv` is provided
    - supports `--cohort all|events|background`
    - supports `--anomaly-mode lat_hour|lat_day|none` to remove mean-flow before parity aggregation
+   - supports `--event-source vortex_or_labels|vortex|labels|ibtracs`
+   - supports storm-centered polar diagnostics via `--polar-enable`
    - supports matched-background control mode (`--control-mode matched_background`)
-5. Run GKA + generate report + blocked-split evaluation.
+   - uses pyarrow streaming controls for large corpora:
+     - `--scan-batch-rows`
+     - `--background-pool-max-rows`
+     - `--background-max-batches-per-lead`
+6. Run GKA + generate report + blocked-split evaluation.
 
 ## Run end-to-end
 
@@ -40,7 +52,9 @@ python examples/weather_real_minipilot/build_tiles.py \
   --prepared-root data/prepared/weather_v1 \
   --out data/tiles/weather_real_v1 \
   --cohort all \
+  --event-source vortex_or_labels \
   --control-mode matched_background \
+  --polar-enable \
   --anomaly-mode lat_hour \
   --lead-buckets 24 120 240 none \
   --max-events-per-lead 12

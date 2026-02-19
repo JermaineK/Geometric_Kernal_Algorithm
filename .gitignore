@@ -10,9 +10,13 @@ htmlcov/
 *.log
 results/
 .tmp/
+data/
+dataset/
 tests/synthetic/outputs/*
 !tests/synthetic/outputs/.gitkeep
 tests/stress/outputs/*
 !tests/stress/outputs/.gitkeep
+tests/weather_stress/outputs/*
+!tests/weather_stress/outputs/.gitkeep
 build/
 dist/

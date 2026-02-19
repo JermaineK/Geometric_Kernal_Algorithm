@@ -10,6 +10,10 @@ import pandas as pd
 import pyarrow.dataset as ds
 import yaml
 
+from gka.weather.ibtracs import load_ibtracs_points, match_tracks_to_ibtracs
+from gka.weather.polar import summarize_polar_features
+from gka.weather.vortex_detect import VortexDetectConfig, detect_vortex_candidates
+from gka.weather.vortex_track import VortexTrackConfig, select_track_centers, summarize_tracks, track_vortex_candidates
 from gka.utils.time import utc_now_iso
 
 
@@ -30,6 +34,77 @@ def parse_args() -> argparse.Namespace:
         help="Lead buckets to include (use 'none' for null lead rows)",
     )
     parser.add_argument("--max-events-per-lead", type=int, default=12, help="Maximum storm centers per lead bucket")
+    parser.add_argument(
+        "--event-source",
+        choices=["vortex_or_labels", "vortex", "labels", "ibtracs"],
+        default="vortex_or_labels",
+        help="How event centers are discovered before tile extraction",
+    )
+    parser.add_argument(
+        "--ibtracs-csv",
+        default=None,
+        help="Optional IBTrACS CSV path used when --event-source ibtracs or for discovery validation",
+    )
+    parser.add_argument(
+        "--vortex-sigma-cells",
+        type=float,
+        default=1.0,
+        help="Gaussian smoothing sigma (grid cells) for vorticity peak detection",
+    )
+    parser.add_argument(
+        "--vortex-zeta-percentile",
+        type=float,
+        default=99.0,
+        help="Percentile threshold for |zeta| candidate extraction per time slice",
+    )
+    parser.add_argument(
+        "--vortex-min-separation-km",
+        type=float,
+        default=180.0,
+        help="Minimum separation (km) between vortex candidates in one time slice",
+    )
+    parser.add_argument(
+        "--vortex-ow-threshold",
+        type=float,
+        default=0.0,
+        help="Maximum local OW median for accepted vortex candidates (vortex cores typically OW<0)",
+    )
+    parser.add_argument(
+        "--vortex-max-candidates-per-time",
+        type=int,
+        default=16,
+        help="Maximum vortex candidates retained per timestamp and lead bucket",
+    )
+    parser.add_argument(
+        "--vortex-max-fragments-per-lead",
+        type=int,
+        default=0,
+        help="Optional cap on scanned parquet fragments per lead for fast smoke runs (0 = no cap)",
+    )
+    parser.add_argument(
+        "--track-max-speed-kmh",
+        type=float,
+        default=300.0,
+        help="Max allowed advection speed for candidate-to-track association",
+    )
+    parser.add_argument(
+        "--track-max-gap-hours",
+        type=float,
+        default=3.0,
+        help="Track can remain unmatched for up to this gap before closure",
+    )
+    parser.add_argument(
+        "--track-min-duration-hours",
+        type=float,
+        default=6.0,
+        help="Minimum duration for track quality filtering",
+    )
+    parser.add_argument(
+        "--track-min-points",
+        type=int,
+        default=4,
+        help="Minimum points for track quality filtering",
+    )
     parser.add_argument(
         "--control-mode",
         choices=["matched_background", "offset"],
@@ -151,7 +226,39 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="For --cohort background, controls sampled per lead (default: --max-events-per-lead)",
     )
+    parser.add_argument(
+        "--scan-batch-rows",
+        type=int,
+        default=200000,
+        help="Record-batch row target used for streaming parquet scans",
+    )
+    parser.add_argument(
+        "--background-pool-max-rows",
+        type=int,
+        default=300000,
+        help="Maximum in-memory rows retained per lead for matched-background candidate pool",
+    )
+    parser.add_argument(
+        "--background-max-batches-per-lead",
+        type=int,
+        default=0,
+        help="Optional cap on scanned batches for background pool generation (0 = no cap)",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Sampling seed")
+    parser.add_argument(
+        "--polar-enable",
+        action="store_true",
+        help="Compute storm-centered polar features and emit polar_features.parquet",
+    )
+    parser.add_argument("--polar-r-bins", type=int, default=64, help="Number of radial bins in polar transform")
+    parser.add_argument("--polar-theta-bins", type=int, default=128, help="Number of angular bins in polar transform")
+    parser.add_argument(
+        "--polar-pitches",
+        nargs="+",
+        type=float,
+        default=[-1.5, -1.0, -0.7, 0.7, 1.0, 1.5],
+        help="Pitch values used by the log-spiral filter",
+    )
     return parser.parse_args()
 
 
@@ -177,22 +284,85 @@ def main() -> int:
 
     lead_buckets = [str(v) for v in args.lead_buckets]
     cohort = str(args.cohort).lower()
+    event_source_requested = str(args.event_source)
+    event_source_effective = str(event_source_requested)
 
     events: list[dict[str, Any]] = []
     controls: list[dict[str, Any]] = []
     control_stats: dict[str, Any] = {}
+    vortex_candidates_df = pd.DataFrame()
+    storm_tracks_df = pd.DataFrame()
+    track_summary_df = pd.DataFrame()
+    ibtracs_match: dict[str, Any] | None = None
     all_cases: list[dict[str, Any]] = []
     if cohort in {"all", "events"}:
-        events = _collect_storm_centers(
-            dataset=dataset,
-            lead_buckets=lead_buckets,
-            max_events_per_lead=int(args.max_events_per_lead),
-            speed_bin_ms=float(args.physical_speed_bin_ms),
-            zeta_bin=float(args.physical_zeta_bin),
-            rng=rng,
-        )
+        if event_source_requested == "ibtracs":
+            if not args.ibtracs_csv:
+                raise ValueError("--event-source ibtracs requires --ibtracs-csv")
+            events = _collect_ibtracs_centers(
+                ibtracs_csv=str(args.ibtracs_csv),
+                lead_buckets=lead_buckets,
+                max_events_per_lead=int(args.max_events_per_lead),
+                lon_min=float(args.lon_min),
+                lon_max=float(args.lon_max),
+                rng=rng,
+            )
+        elif event_source_requested in {"vortex", "vortex_or_labels"}:
+            events, vortex_candidates_df, storm_tracks_df, track_summary_df = _collect_vortex_storm_centers(
+                dataset=dataset,
+                lead_buckets=lead_buckets,
+                max_events_per_lead=int(args.max_events_per_lead),
+                detect_cfg=VortexDetectConfig(
+                    sigma_cells=float(args.vortex_sigma_cells),
+                    zeta_percentile=float(args.vortex_zeta_percentile),
+                    min_separation_km=float(args.vortex_min_separation_km),
+                    ow_threshold=float(args.vortex_ow_threshold),
+                    max_candidates_per_time=int(args.vortex_max_candidates_per_time),
+                ),
+                track_cfg=VortexTrackConfig(
+                    max_speed_kmh=float(args.track_max_speed_kmh),
+                    max_gap_hours=float(args.track_max_gap_hours),
+                ),
+                min_track_duration_hours=float(args.track_min_duration_hours),
+                min_track_points=int(args.track_min_points),
+                max_fragments_per_lead=int(args.vortex_max_fragments_per_lead),
+                scan_batch_rows=int(args.scan_batch_rows),
+            )
+            if (not events) and event_source_requested == "vortex_or_labels":
+                event_source_effective = "labels_fallback"
+                events = _collect_storm_centers(
+                    dataset=dataset,
+                    lead_buckets=lead_buckets,
+                    max_events_per_lead=int(args.max_events_per_lead),
+                    speed_bin_ms=float(args.physical_speed_bin_ms),
+                    zeta_bin=float(args.physical_zeta_bin),
+                    rng=rng,
+                    scan_batch_rows=int(args.scan_batch_rows),
+                    max_batches_per_lead=int(args.background_max_batches_per_lead),
+                )
+        else:
+            events = _collect_storm_centers(
+                dataset=dataset,
+                lead_buckets=lead_buckets,
+                max_events_per_lead=int(args.max_events_per_lead),
+                speed_bin_ms=float(args.physical_speed_bin_ms),
+                zeta_bin=float(args.physical_zeta_bin),
+                rng=rng,
+                scan_batch_rows=int(args.scan_batch_rows),
+                max_batches_per_lead=int(args.background_max_batches_per_lead),
+            )
         if not events and cohort == "events":
             raise RuntimeError("No storm centers were found for requested lead buckets")
+        if args.ibtracs_csv and (not storm_tracks_df.empty):
+            try:
+                ib_points = load_ibtracs_points(
+                    args.ibtracs_csv,
+                    lon_min=float(args.lon_min),
+                    lon_max=float(args.lon_max),
+                )
+                ibtracs_match = match_tracks_to_ibtracs(storm_tracks_df, ib_points)
+            except Exception as exc:
+                ibtracs_match = {"error": f"{type(exc).__name__}: {exc}"}
     if cohort == "all":
         if str(args.control_mode) == "matched_background":
             controls, control_stats = _make_matched_background_controls(
@@ -208,6 +378,9 @@ def main() -> int:
                 lon_offset=float(args.lon_offset_control),
                 lon_min=float(args.lon_min),
                 lon_max=float(args.lon_max),
+                scan_batch_rows=int(args.scan_batch_rows),
+                pool_max_rows=int(args.background_pool_max_rows),
+                max_batches_per_lead=int(args.background_max_batches_per_lead),
             )
         else:
             controls = _make_offset_controls(
@@ -231,6 +404,8 @@ def main() -> int:
             lead_buckets=lead_buckets,
             max_per_lead=int(args.background_per_lead or args.max_events_per_lead),
             rng=rng,
+            scan_batch_rows=int(args.scan_batch_rows),
+            max_batches_per_lead=int(args.background_max_batches_per_lead),
         )
         control_stats = {"mode": "background_only"}
         all_cases = controls
@@ -241,11 +416,12 @@ def main() -> int:
         raise RuntimeError(f"No cases were produced for cohort={cohort}")
 
     rows: list[dict[str, Any]] = []
+    polar_rows: list[dict[str, Any]] = []
     case_manifest: list[dict[str, Any]] = []
     case_manifest_all: list[dict[str, Any]] = []
     anomaly_audit_rows: list[dict[str, Any]] = []
     for case in all_cases:
-        case_rows, case_audit = _extract_case_rows(
+        case_rows, case_polar_rows, case_audit = _extract_case_rows(
             dataset=dataset,
             case=case,
             pre_hours=int(args.pre_hours),
@@ -262,6 +438,10 @@ def main() -> int:
             anomaly_min_bin_samples=int(args.anomaly_min_bin_samples),
             anomaly_min_covered_frac=float(args.anomaly_min_covered_frac),
             min_distinct_scales=int(args.min_distinct_scales_per_case),
+            polar_enable=bool(args.polar_enable),
+            polar_r_bins=int(args.polar_r_bins),
+            polar_theta_bins=int(args.polar_theta_bins),
+            polar_pitches=[float(v) for v in args.polar_pitches],
         )
         case_meta = dict(case)
         case_meta.update(case_audit)
@@ -272,6 +452,7 @@ def main() -> int:
         if not case_rows:
             continue
         rows.extend(case_rows)
+        polar_rows.extend(case_polar_rows)
         case_manifest.append(case_meta)
 
     if not rows:
@@ -310,14 +491,30 @@ def main() -> int:
     samples.to_parquet(out_dir / "samples.parquet", index=False)
     eta_long = _build_eta_long(samples)
     eta_long.to_parquet(out_dir / "eta_long.parquet", index=False)
+    polar_features = pd.DataFrame(polar_rows)
+    if not polar_features.empty:
+        polar_features["t"] = pd.to_datetime(polar_features["t"], errors="coerce")
+        polar_features = polar_features.sort_values(["case_id", "t", "L"]).reset_index(drop=True)
+    polar_features.to_parquet(out_dir / "polar_features.parquet", index=False)
+    if not vortex_candidates_df.empty:
+        vortex_candidates_df.to_parquet(out_dir / "vortex_candidates.parquet", index=False)
+    if not storm_tracks_df.empty:
+        storm_tracks_df.to_parquet(out_dir / "storm_tracks.parquet", index=False)
+    if not track_summary_df.empty:
+        track_summary_df.to_parquet(out_dir / "storm_track_summary.parquet", index=False)
+    if ibtracs_match is not None:
+        (out_dir / "ibtracs_match.json").write_text(json.dumps(ibtracs_match, indent=2, sort_keys=True), encoding="utf-8")
 
     dataset_yaml = {
         "schema_version": 1,
         "domain": "weather",
-        "id": "weather_real_v1_tiles",
-        "description": "Storm-centered real-weather tile aggregates with mirrored channels",
+        "id": "weather_real_vnext_tiles",
+        "description": "Storm-centered real-weather tile aggregates with mirror and polar diagnostics",
         "units": {"time": "UTC timestamp", "L": "km", "omega": "rad/s"},
-        "mirror": {"type": "spatial_reflection", "details": {"axis": "lon", "lon0": 150.0}},
+        "mirror": {
+            "type": "spatial_reflection+polar_angle_reflection",
+            "details": {"axis": "lon", "lon0": 150.0, "polar_theta_mirror": "theta->-theta"},
+        },
         "columns": {
             "time": "t",
             "size": "L",
@@ -343,6 +540,21 @@ def main() -> int:
             "min_distinct_scales_per_case": int(args.min_distinct_scales_per_case),
             "min_controls_per_lead_bucket": int(args.min_controls_per_lead_bucket),
             "min_far_nonstorm_per_lead_bucket": int(args.min_far_nonstorm_per_lead_bucket),
+            "event_source_requested": str(event_source_requested),
+            "event_source_effective": str(event_source_effective),
+            "vortex_sigma_cells": float(args.vortex_sigma_cells),
+            "vortex_zeta_percentile": float(args.vortex_zeta_percentile),
+            "vortex_min_separation_km": float(args.vortex_min_separation_km),
+            "vortex_ow_threshold": float(args.vortex_ow_threshold),
+            "vortex_max_candidates_per_time": int(args.vortex_max_candidates_per_time),
+            "vortex_max_fragments_per_lead": int(args.vortex_max_fragments_per_lead),
+            "scan_batch_rows": int(args.scan_batch_rows),
+            "background_pool_max_rows": int(args.background_pool_max_rows),
+            "background_max_batches_per_lead": int(args.background_max_batches_per_lead),
+            "polar_enable": bool(args.polar_enable),
+            "polar_r_bins": int(args.polar_r_bins),
+            "polar_theta_bins": int(args.polar_theta_bins),
+            "polar_pitches": [float(v) for v in args.polar_pitches],
         },
         "analysis": {
             "knee": {"method": "segmented", "rho": 1.5},
@@ -362,8 +574,20 @@ def main() -> int:
         "prepared_root": str(prepared_root.resolve()),
         "out_dir": str(out_dir.resolve()),
         "cohort": cohort,
+        "event_source_requested": str(event_source_requested),
+        "event_source_effective": str(event_source_effective),
+        "vortex_sigma_cells": float(args.vortex_sigma_cells),
+        "vortex_zeta_percentile": float(args.vortex_zeta_percentile),
+        "vortex_min_separation_km": float(args.vortex_min_separation_km),
+        "vortex_ow_threshold": float(args.vortex_ow_threshold),
+        "vortex_max_candidates_per_time": int(args.vortex_max_candidates_per_time),
+        "vortex_max_fragments_per_lead": int(args.vortex_max_fragments_per_lead),
+        "scan_batch_rows": int(args.scan_batch_rows),
+        "background_pool_max_rows": int(args.background_pool_max_rows),
+        "background_max_batches_per_lead": int(args.background_max_batches_per_lead),
         "control_mode": str(args.control_mode),
         "allow_nonexact_controls": bool(args.allow_nonexact_controls),
+        "ibtracs_csv": str(args.ibtracs_csv) if args.ibtracs_csv else None,
         "anomaly_mode": str(args.anomaly_mode),
         "anomaly_lat_bin_deg": float(args.anomaly_lat_bin_deg),
         "anomaly_lon_bin_deg": float(args.anomaly_lon_bin_deg),
@@ -389,13 +613,23 @@ def main() -> int:
         "n_pairs": int(samples.shape[0] // 2),
         "lead_buckets": [str(v) for v in sorted(samples["lead_bucket"].astype(str).unique())],
         "scales_cells": scales,
+        "polar_enable": bool(args.polar_enable),
+        "polar_feature_rows": int(polar_features.shape[0]),
         "control_match_quality_counts": _count_values(case_manifest, "match_quality"),
         "control_tier_counts": _count_values(case_manifest, "control_tier"),
         "control_stats": control_stats,
         "control_coverage": control_coverage,
+        "n_vortex_candidates": int(vortex_candidates_df.shape[0]),
+        "n_storm_track_points": int(storm_tracks_df.shape[0]),
+        "n_tracks": int(storm_tracks_df["track_id"].nunique()) if not storm_tracks_df.empty and "track_id" in storm_tracks_df.columns else 0,
         "anomaly_commutation": _summarize_anomaly_audit(anomaly_audit_rows),
         "scale_audit_path": str((out_dir / "scale_audit.json").resolve()),
         "eta_long_path": str((out_dir / "eta_long.parquet").resolve()),
+        "polar_features_path": str((out_dir / "polar_features.parquet").resolve()),
+        "vortex_candidates_path": str((out_dir / "vortex_candidates.parquet").resolve()) if not vortex_candidates_df.empty else None,
+        "storm_tracks_path": str((out_dir / "storm_tracks.parquet").resolve()) if not storm_tracks_df.empty else None,
+        "storm_track_summary_path": str((out_dir / "storm_track_summary.parquet").resolve()) if not track_summary_df.empty else None,
+        "ibtracs_match": ibtracs_match,
     }
     (out_dir / "build_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -411,6 +645,8 @@ def _collect_storm_centers(
     speed_bin_ms: float,
     zeta_bin: float,
     rng: np.random.Generator,
+    scan_batch_rows: int = 200000,
+    max_batches_per_lead: int = 0,
 ) -> list[dict[str, Any]]:
     optional_id_cols = [c for c in ("storm_id", "ms_id", "tc_id", "sid") if c in set(dataset.schema.names)]
     extra_phys_cols = [c for c in ("u10", "v10", "zeta") if c in set(dataset.schema.names)]
@@ -427,28 +663,43 @@ def _collect_storm_centers(
     ] + optional_id_cols
     out: list[dict[str, Any]] = []
     for lead in lead_buckets:
-        table = None
         label_used = None
+        centers = pd.DataFrame()
         for label_col in ("storm_point", "storm", "near_storm"):
-            filt = (ds.field("lead_partition") == lead) & (ds.field(label_col) == 1)
-            candidate = dataset.to_table(columns=cols, filter=filt)
-            if candidate.num_rows > 0:
-                table = candidate
+            filt = _lead_filter(lead) & (ds.field(label_col) == 1)
+            scanner = dataset.scanner(
+                columns=cols,
+                filter=filt,
+                batch_size=max(int(scan_batch_rows), 1),
+            )
+            best_by_time: dict[pd.Timestamp, dict[str, Any]] = {}
+            batch_idx = 0
+            for batch in scanner.to_batches():
+                frame = batch.to_pandas()
+                if frame.empty:
+                    continue
+                batch_idx += 1
+                if int(max_batches_per_lead) > 0 and batch_idx > int(max_batches_per_lead):
+                    break
+                frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+                frame = frame.dropna(subset=["time", "lat", "lon"])
+                if frame.empty:
+                    continue
+                frame["gka_score"] = pd.to_numeric(frame["gka_score"], errors="coerce").fillna(-np.inf)
+                frame = frame.sort_values(["time", "gka_score"], ascending=[True, False])
+                frame = frame.drop_duplicates(subset=["time"], keep="first")
+                for _, row in frame.iterrows():
+                    t_key = pd.Timestamp(row["time"])
+                    current = best_by_time.get(t_key)
+                    score = float(row.get("gka_score", -np.inf))
+                    if current is None or float(current.get("gka_score", -np.inf)) < score:
+                        best_by_time[t_key] = row.to_dict()
+            if best_by_time:
+                centers = pd.DataFrame(list(best_by_time.values()))
                 label_used = label_col
                 break
-        if table is None:
+        if centers.empty:
             continue
-        if table.num_rows == 0:
-            continue
-        frame = table.to_pandas()
-        frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
-        frame = frame.dropna(subset=["time", "lat", "lon"])
-        if frame.empty:
-            continue
-        frame["gka_score"] = pd.to_numeric(frame["gka_score"], errors="coerce").fillna(-np.inf)
-        # one center per timestamp: take max score cell
-        frame = frame.sort_values(["time", "gka_score"], ascending=[True, False])
-        centers = frame.drop_duplicates(subset=["time"], keep="first").reset_index(drop=True)
         if centers.shape[0] > int(max_events_per_lead):
             pick = np.sort(rng.choice(centers.index.to_numpy(), size=int(max_events_per_lead), replace=False))
             centers = centers.loc[pick].reset_index(drop=True)
@@ -490,6 +741,153 @@ def _collect_storm_centers(
                         if np.isfinite(float(row.get("zeta", np.nan)))
                         else None
                     ),
+                }
+            )
+    return out
+
+
+def _collect_vortex_storm_centers(
+    *,
+    dataset: ds.Dataset,
+    lead_buckets: list[str],
+    max_events_per_lead: int,
+    detect_cfg: VortexDetectConfig,
+    track_cfg: VortexTrackConfig,
+    min_track_duration_hours: float,
+    min_track_points: int,
+    max_fragments_per_lead: int,
+    scan_batch_rows: int,
+) -> tuple[list[dict[str, Any]], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    available = set(dataset.schema.names)
+    base_cols = ["time", "lat", "lon", "u10", "v10", "lead_partition"]
+    mslp_col = "mslp" if "mslp" in available else None
+    if mslp_col:
+        base_cols.append(mslp_col)
+    missing = [c for c in ("time", "lat", "lon", "u10", "v10", "lead_partition") if c not in available]
+    if missing:
+        raise ValueError(
+            f"Prepared dataset is missing required fields for vortex discovery: {missing}. "
+            "Run prepare_weather_v1.py to populate u10/v10 gridded partitions."
+        )
+
+    events: list[dict[str, Any]] = []
+    all_candidates: list[pd.DataFrame] = []
+    all_tracks: list[pd.DataFrame] = []
+    all_summaries: list[pd.DataFrame] = []
+
+    for lead in lead_buckets:
+        filt = _lead_filter(lead)
+        lead_candidates: list[pd.DataFrame] = []
+        scanner = dataset.scanner(
+            columns=base_cols,
+            filter=filt,
+            batch_size=max(int(scan_batch_rows), 1),
+        )
+        batch_idx = 0
+        for batch in scanner.to_batches():
+            frame = batch.to_pandas()
+            if frame.empty:
+                continue
+            batch_idx += 1
+            if int(max_fragments_per_lead) > 0 and batch_idx > int(max_fragments_per_lead):
+                break
+            cand = detect_vortex_candidates(
+                frame,
+                lead_bucket=str(lead),
+                mslp_col=mslp_col,
+                config=detect_cfg,
+            )
+            if not cand.empty:
+                lead_candidates.append(cand)
+        if not lead_candidates:
+            continue
+        cand_df = pd.concat(lead_candidates, ignore_index=True)
+        cand_df["lead_bucket"] = str(lead)
+        tracks = track_vortex_candidates(cand_df, config=track_cfg)
+        if tracks.empty:
+            cand_ranked = cand_df.sort_values(["score", "time"], ascending=[False, True]).head(int(max_events_per_lead))
+            for idx, row in cand_ranked.reset_index(drop=True).iterrows():
+                events.append(
+                    {
+                        "case_id": f"storm_lead{lead}_{idx:04d}",
+                        "case_type": "storm",
+                        "event_label": "vortex_candidate",
+                        "storm_id": f"candidate_{lead}_{idx:04d}",
+                        "lead_bucket": str(lead),
+                        "time0": pd.Timestamp(row["time"]),
+                        "lat0": float(row["lat0"]),
+                        "lon0": float(row["lon0"]),
+                        "speed_bin": None,
+                        "zeta_bin": (
+                            float(np.floor(float(row.get("zeta_peak", np.nan)) / 1e-5) * 1e-5)
+                            if np.isfinite(float(row.get("zeta_peak", np.nan)))
+                            else None
+                        ),
+                    }
+                )
+            all_candidates.append(cand_df)
+            continue
+
+        tracks["lead_bucket"] = str(lead)
+        track_summary = summarize_tracks(
+            tracks,
+            min_duration_hours=float(min_track_duration_hours),
+            min_points=int(min_track_points),
+        )
+        centers = select_track_centers(
+            tracks,
+            track_summary,
+            max_events=int(max_events_per_lead),
+            lead_bucket=str(lead),
+        )
+        events.extend(centers)
+        all_candidates.append(cand_df)
+        all_tracks.append(tracks)
+        all_summaries.append(track_summary)
+
+    cand_out = pd.concat(all_candidates, ignore_index=True) if all_candidates else pd.DataFrame()
+    track_out = pd.concat(all_tracks, ignore_index=True) if all_tracks else pd.DataFrame()
+    summary_out = pd.concat(all_summaries, ignore_index=True) if all_summaries else pd.DataFrame()
+    return events, cand_out, track_out, summary_out
+
+
+def _collect_ibtracs_centers(
+    *,
+    ibtracs_csv: str,
+    lead_buckets: list[str],
+    max_events_per_lead: int,
+    lon_min: float,
+    lon_max: float,
+    rng: np.random.Generator,
+) -> list[dict[str, Any]]:
+    ib = load_ibtracs_points(
+        ibtracs_csv,
+        lon_min=float(lon_min),
+        lon_max=float(lon_max),
+    )
+    if ib.empty:
+        return []
+    out: list[dict[str, Any]] = []
+    for lead in lead_buckets:
+        take = ib.copy()
+        take = take.sort_values(["storm_id", "time"]).drop_duplicates(subset=["storm_id", "time"], keep="first").reset_index(drop=True)
+        if take.shape[0] > int(max_events_per_lead):
+            sel = np.sort(rng.choice(take.index.to_numpy(), size=int(max_events_per_lead), replace=False))
+            take = take.loc[sel].reset_index(drop=True)
+        for i, row in take.iterrows():
+            out.append(
+                {
+                    "case_id": f"storm_lead{lead}_{i:04d}",
+                    "case_type": "storm",
+                    "event_label": "ibtracs",
+                    "storm_id": str(row["storm_id"]),
+                    "lead_bucket": str(lead),
+                    "time0": pd.Timestamp(row["time"]),
+                    "lat0": float(row["lat0"]),
+                    "lon0": float(row["lon0"]),
+                    "speed_bin": None,
+                    "zeta_bin": None,
+                    "track_id": None,
                 }
             )
     return out
@@ -539,6 +937,9 @@ def _make_matched_background_controls(
     lon_offset: float,
     lon_min: float,
     lon_max: float,
+    scan_batch_rows: int,
+    pool_max_rows: int,
+    max_batches_per_lead: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not events:
         return [], {"requested": 0, "matched": 0, "dropped": 0, "mode": "matched_background"}
@@ -560,6 +961,10 @@ def _make_matched_background_controls(
             lon_bin_deg=lon_bin_deg,
             speed_bin_ms=float(speed_bin_ms),
             zeta_bin=float(zeta_bin),
+            rng=rng,
+            scan_batch_rows=int(scan_batch_rows),
+            max_rows=int(pool_max_rows),
+            max_batches_per_lead=int(max_batches_per_lead),
         )
         using_cross_lead_none = False
         if pool.empty:
@@ -572,6 +977,10 @@ def _make_matched_background_controls(
                         lon_bin_deg=lon_bin_deg,
                         speed_bin_ms=float(speed_bin_ms),
                         zeta_bin=float(zeta_bin),
+                        rng=rng,
+                        scan_batch_rows=int(scan_batch_rows),
+                        max_rows=int(pool_max_rows),
+                        max_batches_per_lead=int(max_batches_per_lead),
                     )
                 if pool_none_cache is not None and not pool_none_cache.empty:
                     pool = pool_none_cache.copy()
@@ -657,6 +1066,10 @@ def _background_pool_for_lead(
     lon_bin_deg: float,
     speed_bin_ms: float,
     zeta_bin: float,
+    rng: np.random.Generator,
+    scan_batch_rows: int,
+    max_rows: int,
+    max_batches_per_lead: int,
 ) -> pd.DataFrame:
     cols = [
         "time",
@@ -671,33 +1084,60 @@ def _background_pool_for_lead(
         "zeta",
     ]
     filt = (
-        (ds.field("lead_partition") == str(lead))
+        _lead_filter(lead)
         & (ds.field("storm") == 0)
         & (ds.field("near_storm") == 0)
         & (ds.field("pregen") == 0)
     )
-    table = dataset.to_table(columns=cols, filter=filt)
-    if table.num_rows == 0:
-        return pd.DataFrame(columns=["time", "lat", "lon", "month", "hour", "lat_bin", "lon_bin", "speed_bin", "zeta_bin"])
-    frame = table.to_pandas()
-    frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
-    frame = frame.dropna(subset=["time", "lat", "lon"])
-    if frame.empty:
-        return pd.DataFrame(columns=["time", "lat", "lon", "month", "hour", "lat_bin", "lon_bin", "speed_bin", "zeta_bin"])
-    frame["month"] = frame["time"].dt.month.astype(int)
-    frame["hour"] = frame["time"].dt.hour.astype(int)
-    frame["lat_bin"] = _lat_bin(pd.to_numeric(frame["lat"], errors="coerce"), lat_bin_deg)
-    frame["lon_bin"] = _lon_bin(pd.to_numeric(frame["lon"], errors="coerce"), lon_bin_deg)
-    u = pd.to_numeric(frame.get("u10"), errors="coerce")
-    v = pd.to_numeric(frame.get("v10"), errors="coerce")
-    speed = np.sqrt(np.square(u) + np.square(v))
-    frame["speed_bin"] = np.floor(speed / max(float(speed_bin_ms), 1e-6)) * max(float(speed_bin_ms), 1e-6)
-    zeta = pd.to_numeric(frame.get("zeta"), errors="coerce")
-    frame["zeta_bin"] = np.floor(zeta / max(float(zeta_bin), 1e-12)) * max(float(zeta_bin), 1e-12)
-    frame = frame.dropna(subset=["lat_bin", "lon_bin"])
-    return frame[
-        ["time", "lat", "lon", "month", "hour", "lat_bin", "lon_bin", "speed_bin", "zeta_bin"]
-    ].reset_index(drop=True)
+    out_cols = ["time", "lat", "lon", "month", "hour", "lat_bin", "lon_bin", "speed_bin", "zeta_bin"]
+    scanner = dataset.scanner(
+        columns=cols,
+        filter=filt,
+        batch_size=max(int(scan_batch_rows), 1),
+    )
+    pool: pd.DataFrame | None = None
+    batch_idx = 0
+    for batch in scanner.to_batches():
+        frame = batch.to_pandas()
+        if frame.empty:
+            continue
+        batch_idx += 1
+        if int(max_batches_per_lead) > 0 and batch_idx > int(max_batches_per_lead):
+            break
+        frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+        frame = frame.dropna(subset=["time", "lat", "lon"])
+        if frame.empty:
+            continue
+        frame["month"] = frame["time"].dt.month.astype(int)
+        frame["hour"] = frame["time"].dt.hour.astype(int)
+        frame["lat_bin"] = _lat_bin(pd.to_numeric(frame["lat"], errors="coerce"), lat_bin_deg)
+        frame["lon_bin"] = _lon_bin(pd.to_numeric(frame["lon"], errors="coerce"), lon_bin_deg)
+        u = pd.to_numeric(frame.get("u10"), errors="coerce")
+        v = pd.to_numeric(frame.get("v10"), errors="coerce")
+        speed = np.sqrt(np.square(u) + np.square(v))
+        frame["speed_bin"] = np.floor(speed / max(float(speed_bin_ms), 1e-6)) * max(float(speed_bin_ms), 1e-6)
+        zeta = pd.to_numeric(frame.get("zeta"), errors="coerce")
+        frame["zeta_bin"] = np.floor(zeta / max(float(zeta_bin), 1e-12)) * max(float(zeta_bin), 1e-12)
+        frame = frame.dropna(subset=["lat_bin", "lon_bin"])
+        if frame.empty:
+            continue
+        chunk = frame[out_cols].reset_index(drop=True)
+        if int(max_rows) <= 0:
+            if pool is None:
+                pool = chunk
+            else:
+                pool = pd.concat([pool, chunk], ignore_index=True)
+            continue
+        if pool is None:
+            pool = chunk
+        else:
+            pool = pd.concat([pool, chunk], ignore_index=True)
+        if pool.shape[0] > int(max_rows):
+            keep_idx = np.sort(rng.choice(pool.index.to_numpy(), size=int(max_rows), replace=False))
+            pool = pool.loc[keep_idx].reset_index(drop=True)
+    if pool is None or pool.empty:
+        return pd.DataFrame(columns=out_cols)
+    return pool[out_cols].reset_index(drop=True)
 
 
 def _pick_matched_background_row(
@@ -784,34 +1224,50 @@ def _collect_background_centers(
     lead_buckets: list[str],
     max_per_lead: int,
     rng: np.random.Generator,
+    scan_batch_rows: int,
+    max_batches_per_lead: int,
 ) -> list[dict[str, Any]]:
     cols = ["time", "lat", "lon", "lead_partition"]
     out: list[dict[str, Any]] = []
     for lead in lead_buckets:
         filt = (
-            (ds.field("lead_partition") == lead)
+            _lead_filter(lead)
             & (ds.field("storm") == 0)
             & (ds.field("near_storm") == 0)
             & (ds.field("pregen") == 0)
         )
-        table = dataset.to_table(columns=cols, filter=filt)
-        if table.num_rows == 0:
-            continue
-        frame = table.to_pandas()
-        frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
-        frame = frame.dropna(subset=["time", "lat", "lon"])
-        if frame.empty:
-            continue
-
-        picks: list[int] = []
-        for _, idx in frame.groupby("time", sort=False).groups.items():
-            idx_arr = np.asarray(list(idx), dtype=int)
-            if idx_arr.size == 0:
+        scanner = dataset.scanner(
+            columns=cols,
+            filter=filt,
+            batch_size=max(int(scan_batch_rows), 1),
+        )
+        picks_by_time: dict[pd.Timestamp, dict[str, Any]] = {}
+        batch_idx = 0
+        for batch in scanner.to_batches():
+            frame = batch.to_pandas()
+            if frame.empty:
                 continue
-            picks.append(int(rng.choice(idx_arr)))
-        if not picks:
+            batch_idx += 1
+            if int(max_batches_per_lead) > 0 and batch_idx > int(max_batches_per_lead):
+                break
+            frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+            frame = frame.dropna(subset=["time", "lat", "lon"])
+            if frame.empty:
+                continue
+            for t_val, grp in frame.groupby("time", sort=False):
+                if grp.empty:
+                    continue
+                row = grp.iloc[int(rng.integers(0, grp.shape[0]))]
+                # Reservoir-style replacement across batches by random keep.
+                if t_val not in picks_by_time or bool(rng.random() < 0.5):
+                    picks_by_time[pd.Timestamp(t_val)] = {
+                        "time": pd.Timestamp(row["time"]),
+                        "lat": float(row["lat"]),
+                        "lon": float(row["lon"]),
+                    }
+        if not picks_by_time:
             continue
-        centers = frame.loc[np.asarray(picks, dtype=int)].reset_index(drop=True)
+        centers = pd.DataFrame(list(picks_by_time.values())).sort_values("time").reset_index(drop=True)
         if centers.shape[0] > int(max_per_lead):
             sel = np.sort(rng.choice(centers.index.to_numpy(), size=int(max_per_lead), replace=False))
             centers = centers.loc[sel].reset_index(drop=True)
@@ -853,7 +1309,11 @@ def _extract_case_rows(
     anomaly_min_bin_samples: int,
     anomaly_min_covered_frac: float,
     min_distinct_scales: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    polar_enable: bool,
+    polar_r_bins: int,
+    polar_theta_bins: int,
+    polar_pitches: list[float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     t0 = pd.Timestamp(case["time0"])
     lead = str(case["lead_bucket"])
     lat0 = float(case["lat0"])
@@ -864,7 +1324,7 @@ def _extract_case_rows(
     half_deg = float(tile_half_cells) * float(grid_step_deg)
 
     filt = (
-        (ds.field("lead_partition") == lead)
+        _lead_filter(lead)
         & (ds.field("time") >= t_start)
         & (ds.field("time") <= t_end)
         & (ds.field("lat") >= (lat0 - half_deg))
@@ -920,12 +1380,12 @@ def _extract_case_rows(
         )
     table = dataset.to_table(columns=cols, filter=filt)
     if table.num_rows == 0:
-        return [], _default_case_audit(anomaly_mode)
+        return [], [], _default_case_audit(anomaly_mode)
     frame = table.to_pandas()
     frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
     frame = frame.dropna(subset=["time", "lat", "lon"])
     if frame.empty:
-        return [], _default_case_audit(anomaly_mode)
+        return [], [], _default_case_audit(anomaly_mode)
 
     frame["u10"] = pd.to_numeric(frame["u10"], errors="coerce")
     frame["v10"] = pd.to_numeric(frame["v10"], errors="coerce")
@@ -1043,7 +1503,7 @@ def _extract_case_rows(
 
     frame = frame.dropna(subset=["speed_l_raw", "speed_r_raw", "speed_l_effective", "speed_r_effective"])
     if frame.empty:
-        return [], _default_case_audit(
+        return [], [], _default_case_audit(
             requested_mode,
             effective_mode=effective_mode,
             commute_pass=commute_pass,
@@ -1051,6 +1511,7 @@ def _extract_case_rows(
         )
 
     rows: list[dict[str, Any]] = []
+    polar_rows: list[dict[str, Any]] = []
     scale_point_counts: dict[str, int] = {}
     scales_used_cells: list[int] = []
     for scale in scales:
@@ -1084,6 +1545,7 @@ def _extract_case_rows(
         agg = subset.groupby("time", as_index=False).agg(**agg_spec).sort_values("time")
         if agg.empty:
             continue
+        subset_by_time = {pd.Timestamp(k): g.copy() for k, g in subset.groupby("time", sort=False)}
         valid_for_scale = 0
         L_km = float(scale) * float(cell_km)
         for _, row in agg.iterrows():
@@ -1111,6 +1573,83 @@ def _extract_case_rows(
                 o_l_scalar = o_l_raw
             if not np.isfinite(o_r_scalar) or o_r_scalar <= 0:
                 o_r_scalar = o_r_raw
+
+            polar_orig = {
+                "left_response": np.nan,
+                "right_response": np.nan,
+                "chirality": np.nan,
+                "spiral_score": np.nan,
+                "dominant_m": np.nan,
+                "dominant_m_power": np.nan,
+                "phase_consistency": np.nan,
+            }
+            polar_mirror = {
+                "left_response": np.nan,
+                "right_response": np.nan,
+                "chirality": np.nan,
+                "spiral_score": np.nan,
+                "dominant_m": np.nan,
+                "dominant_m_power": np.nan,
+                "phase_consistency": np.nan,
+            }
+            if bool(polar_enable):
+                slice_df = subset_by_time.get(t_val)
+                if slice_df is not None and not slice_df.empty:
+                    try:
+                        polar_orig = summarize_polar_features(
+                            slice_df,
+                            lat0=float(lat0),
+                            lon0=float(lon0),
+                            u_col="u10",
+                            v_col="v10",
+                            n_r=int(polar_r_bins),
+                            n_theta=int(polar_theta_bins),
+                            r_max_km=float(L_km),
+                            pitch_values=polar_pitches,
+                        )
+                        polar_mirror = summarize_polar_features(
+                            slice_df,
+                            lat0=float(lat0),
+                            lon0=float(lon0),
+                            u_col="u10_mirror",
+                            v_col="v10_mirror",
+                            n_r=int(polar_r_bins),
+                            n_theta=int(polar_theta_bins),
+                            r_max_km=float(L_km),
+                            pitch_values=polar_pitches,
+                        )
+                    except Exception:
+                        polar_orig = {
+                            "left_response": np.nan,
+                            "right_response": np.nan,
+                            "chirality": np.nan,
+                            "spiral_score": np.nan,
+                            "dominant_m": np.nan,
+                            "dominant_m_power": np.nan,
+                            "phase_consistency": np.nan,
+                        }
+                        polar_mirror = dict(polar_orig)
+                polar_rows.append(
+                    {
+                        "case_id": case["case_id"],
+                        "case_type": case["case_type"],
+                        "t": t_val,
+                        "L": L_km,
+                        "lead_bucket": lead,
+                        "lat0": float(lat0),
+                        "lon0": float(lon0),
+                        "polar_left_response_orig": float(polar_orig.get("left_response", np.nan)),
+                        "polar_right_response_orig": float(polar_orig.get("right_response", np.nan)),
+                        "polar_left_response_mirror": float(polar_mirror.get("left_response", np.nan)),
+                        "polar_right_response_mirror": float(polar_mirror.get("right_response", np.nan)),
+                        "polar_chirality_orig": float(polar_orig.get("chirality", np.nan)),
+                        "polar_chirality_mirror": float(polar_mirror.get("chirality", np.nan)),
+                        "polar_spiral_score_orig": float(polar_orig.get("spiral_score", np.nan)),
+                        "polar_spiral_score_mirror": float(polar_mirror.get("spiral_score", np.nan)),
+                        "polar_phase_consistency_orig": float(polar_orig.get("phase_consistency", np.nan)),
+                        "polar_phase_consistency_mirror": float(polar_mirror.get("phase_consistency", np.nan)),
+                    }
+                )
             is_control_case = str(case.get("case_type", "")).lower() == "control"
             storm_v = 0 if is_control_case else int(row["storm"])
             near_v = 0 if is_control_case else int(row["near_storm"])
@@ -1162,6 +1701,10 @@ def _extract_case_rows(
                     "O_meanflow": o_l_h,
                     "O_lat_hour": o_l_h,
                     "O_lat_day": o_l_d,
+                    "O_polar_spiral": _finite_positive(polar_orig.get("spiral_score"), eps=1e-8, default=np.nan),
+                    "O_polar_chiral": _finite_positive(abs(float(polar_orig.get("chirality", np.nan))), eps=1e-8, default=np.nan),
+                    "O_polar_left": _finite_positive(polar_orig.get("left_response"), eps=1e-8, default=np.nan),
+                    "O_polar_right": _finite_positive(polar_orig.get("right_response"), eps=1e-8, default=np.nan),
                 }
             )
             rows.append(
@@ -1177,6 +1720,10 @@ def _extract_case_rows(
                     "O_meanflow": o_r_h,
                     "O_lat_hour": o_r_h,
                     "O_lat_day": o_r_d,
+                    "O_polar_spiral": _finite_positive(polar_mirror.get("spiral_score"), eps=1e-8, default=np.nan),
+                    "O_polar_chiral": _finite_positive(abs(float(polar_mirror.get("chirality", np.nan))), eps=1e-8, default=np.nan),
+                    "O_polar_left": _finite_positive(polar_mirror.get("left_response"), eps=1e-8, default=np.nan),
+                    "O_polar_right": _finite_positive(polar_mirror.get("right_response"), eps=1e-8, default=np.nan),
                 }
             )
             valid_for_scale += 1
@@ -1203,8 +1750,8 @@ def _extract_case_rows(
     )
     if len(unique_scales) < int(min_distinct_scales):
         case_audit["excluded_reason"] = "insufficient_scales"
-        return [], case_audit
-    return rows, case_audit
+        return [], [], case_audit
+    return rows, polar_rows, case_audit
 
 
 def _apply_anomaly_removal(
@@ -1274,6 +1821,12 @@ def _apply_anomaly_removal(
         metrics["bin_count_median"] = None
         metrics["bin_coverage_frac"] = 0.0
     return out, metrics
+
+
+def _lead_filter(lead: str) -> ds.Expression:
+    """Partition-aware lead filter."""
+
+    return ds.field("lead") == str(lead)
 
 
 def _lat_bin(values: pd.Series, lat_bin_deg: float) -> pd.Series:
@@ -1574,6 +2127,16 @@ def _build_scale_audit(case_manifest_all: list[dict[str, Any]]) -> dict[str, Any
         "by_lead": lead_summary.to_dict(orient="records"),
         "by_case": by_case.to_dict(orient="records"),
     }
+
+
+def _finite_positive(value: Any, eps: float = 0.0, default: float | None = None) -> float | None:
+    try:
+        out = float(value)
+    except Exception:
+        return default
+    if not np.isfinite(out) or out <= 0.0:
+        return default
+    return float(out + float(eps))
 
 
 def _count_values(rows: list[dict[str, Any]], key: str) -> dict[str, int]:

@@ -48,6 +48,8 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             "W_mu": _safe_float(row.get("W_mu")),
             "R_align": _safe_float(row.get("R_align")),
             "band_class_hat": row.get("band_class_hat"),
+            "eigen_band": row.get("eigen_band"),
+            "stability_margin": _safe_float(row.get("stability_margin")),
             "knee_detected": bool(row.get("knee_detected", False)),
             "knee_rejected_because": row.get("knee_rejected_because"),
         }
