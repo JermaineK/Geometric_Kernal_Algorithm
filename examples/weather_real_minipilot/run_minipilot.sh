@@ -24,7 +24,6 @@ python examples/weather_real_minipilot/build_tiles.py \
   --out "${TILES_DATASET}" \
   --cohort all \
   --centers hybrid \
-  --ibtracs-csv "${IBTRACS_PATH}" \
   --distance-time-tolerance-hours 3.0 \
   --scan-batch-rows 120000 \
   --background-pool-max-rows 300000 \
@@ -87,6 +86,14 @@ python examples/weather_real_minipilot/evaluate_minipilot.py \
   --parity-far-max 0.35 \
   --anomaly-agreement-mean-min 0.85 \
   --anomaly-agreement-min-min 0.80 \
+  --anomaly-mode-agreement-min 0.70 \
+  --mode-invariant-event-minus-far-min 0.15 \
+  --mode-invariant-far-max 0.35 \
+  --angular-witness-margin-min 0.10 \
+  --angular-witness-null-drop-min 0.30 \
+  --angular-witness-null-abs-drop-min 0.05 \
+  --null-collapse-min-drop 0.50 \
+  --null-collapse-min-abs-drop 0.15 \
   --knee-weather-delta-bic-min 6.0 \
   --knee-weather-resid-improvement-min 0.75 \
   --knee-weather-slope-delta-min 0.20 \
