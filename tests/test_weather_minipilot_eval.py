@@ -482,3 +482,49 @@ def test_ibtracs_strict_eval_builds_overlay() -> None:
     assert out["available"] is True
     assert out["n_event_cases"] == 2
     assert out["n_far_cases"] == 2
+
+
+def test_ibtracs_alignment_gate_flags_unfavorable_overlay() -> None:
+    mod = _load_eval_module()
+    gate = mod._build_ibtracs_alignment_gate(
+        strict_eval={
+            "available": True,
+            "n_event_cases": 7,
+            "n_far_cases": 12,
+            "event_minus_far_parity_rate": -0.26,
+            "confound_rate": 1.45,
+        },
+        min_event_cases=5,
+        min_far_cases=5,
+        margin_min=0.0,
+        confound_max=1.0,
+    )
+    assert gate["passed"] is False
+    assert any("negative_or_low_margin" in r for r in gate["reason_codes"])
+    assert any("confound_exceeds_max" in r for r in gate["reason_codes"])
+
+
+def test_ibtracs_alignment_gate_reports_coverage_and_diagnostic_suspects() -> None:
+    mod = _load_eval_module()
+    gate = mod._build_ibtracs_alignment_gate(
+        strict_eval={
+            "available": True,
+            "n_event_cases": 2,
+            "n_far_cases": 1,
+            "event_minus_far_parity_rate": -0.05,
+            "confound_rate": 1.2,
+            "time_hours": 3.0,
+            "radius_km": 300.0,
+            "dist_km_summary": {"p05": 100.0, "p50": 12000.0, "p95": 18000.0, "max": 25000.0},
+            "dt_hours_summary": {"p50": 2.8, "p95": 3.0},
+        },
+        min_event_cases=5,
+        min_far_cases=5,
+        margin_min=0.0,
+        confound_max=1.0,
+    )
+    assert gate["passed"] is False
+    assert any("too_few_ibtracs_event_cases" in r for r in gate["reason_codes"])
+    assert any("too_few_ibtracs_far_cases" in r for r in gate["reason_codes"])
+    assert "time_basis_mismatch_suspected" in gate["reason_codes"]
+    assert "distance_units_suspected" in gate["reason_codes"]

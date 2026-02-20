@@ -10,6 +10,11 @@ import pandas as pd
 import pyarrow.dataset as ds
 import yaml
 
+from gka.external.ibtracs import (
+    build_track_index,
+    nearest_ibtracs_fix,
+    normalize_lon_180,
+)
 from gka.ops.polar import compute_polar_metrics, compute_polar_parity_metrics
 from gka.weather.ibtracs import (
     haversine_km_vec,
@@ -93,8 +98,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--distance-far-km",
         type=float,
-        default=1500.0,
+        default=800.0,
         help="Distance threshold (km) lower bound for far-nonstorm cohort",
+    )
+    parser.add_argument(
+        "--ibtracs-exclusion-window-hours",
+        type=float,
+        default=48.0,
+        help="Far-nonstorm exclusion window (hours). Far requires no storm within this window.",
     )
     parser.add_argument(
         "--vortex-sigma-cells",
@@ -362,6 +373,8 @@ def main() -> int:
     ibtracs_catalog: dict[str, Any] | None = None
     ib_points_filtered = pd.DataFrame()
     ib_points_hourly = pd.DataFrame()
+    ib_index = None
+    ib_index_meta: dict[str, Any] = {}
     all_cases: list[dict[str, Any]] = []
     if args.ibtracs_csv:
         try:
@@ -384,6 +397,8 @@ def main() -> int:
             )
             ib_points_filtered = pd.read_parquet(ib_points_path)
             ib_points_hourly = pd.read_parquet(ib_hourly_path)
+            ib_index = _build_ibtracs_index(ib_points_hourly if not ib_points_hourly.empty else ib_points_filtered)
+            ib_index_meta = _ibtracs_index_meta(ib_index)
         except Exception as exc:
             ibtracs_catalog = {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -517,37 +532,40 @@ def main() -> int:
             }
         for control in controls:
             control.setdefault("center_source", "background")
-        if not ib_points_hourly.empty:
+        if ib_index is not None:
             events = _annotate_cases_with_storm_distance(
                 events,
-                ib_points_hourly=ib_points_hourly,
+                ib_index=ib_index,
                 tolerance_hours=float(args.distance_time_tolerance_hours),
                 event_km=float(args.distance_event_km),
                 near_km=float(args.distance_near_km),
                 far_km=float(args.distance_far_km),
+                exclusion_window_hours=float(args.ibtracs_exclusion_window_hours),
             )
             controls = _annotate_cases_with_storm_distance(
                 controls,
-                ib_points_hourly=ib_points_hourly,
+                ib_index=ib_index,
                 tolerance_hours=float(args.distance_time_tolerance_hours),
                 event_km=float(args.distance_event_km),
                 near_km=float(args.distance_near_km),
                 far_km=float(args.distance_far_km),
+                exclusion_window_hours=float(args.ibtracs_exclusion_window_hours),
             )
             before = len(controls)
-            controls = [c for c in controls if str(c.get("storm_distance_cohort")) == "far_nonstorm"]
+            controls = [c for c in controls if bool(c.get("ib_far", False))]
             control_stats = dict(control_stats or {})
             control_stats["dropped_not_far_nonstorm"] = int(max(0, before - len(controls)))
         all_cases = events + controls
     elif cohort == "events":
-        if not ib_points_hourly.empty:
+        if ib_index is not None:
             events = _annotate_cases_with_storm_distance(
                 events,
-                ib_points_hourly=ib_points_hourly,
+                ib_index=ib_index,
                 tolerance_hours=float(args.distance_time_tolerance_hours),
                 event_km=float(args.distance_event_km),
                 near_km=float(args.distance_near_km),
                 far_km=float(args.distance_far_km),
+                exclusion_window_hours=float(args.ibtracs_exclusion_window_hours),
             )
         all_cases = events
     elif cohort == "background":
@@ -561,16 +579,17 @@ def main() -> int:
         )
         for control in controls:
             control.setdefault("center_source", "background")
-        if not ib_points_hourly.empty:
+        if ib_index is not None:
             controls = _annotate_cases_with_storm_distance(
                 controls,
-                ib_points_hourly=ib_points_hourly,
+                ib_index=ib_index,
                 tolerance_hours=float(args.distance_time_tolerance_hours),
                 event_km=float(args.distance_event_km),
                 near_km=float(args.distance_near_km),
                 far_km=float(args.distance_far_km),
+                exclusion_window_hours=float(args.ibtracs_exclusion_window_hours),
             )
-            controls = [c for c in controls if str(c.get("storm_distance_cohort")) == "far_nonstorm"]
+            controls = [c for c in controls if bool(c.get("ib_far", False))]
         control_stats = {"mode": "background_only"}
         all_cases = controls
     else:
@@ -625,21 +644,33 @@ def main() -> int:
     samples = pd.DataFrame(rows)
     samples["t"] = pd.to_datetime(samples["t"], errors="coerce")
     samples = samples.sort_values(["case_id", "t", "L", "hand"]).reset_index(drop=True)
-    if not ib_points_hourly.empty:
+    if ib_index is not None:
         samples = _annotate_samples_with_storm_distance(
             samples=samples,
-            ib_points_hourly=ib_points_hourly,
+            ib_index=ib_index,
             tolerance_hours=float(args.distance_time_tolerance_hours),
             event_km=float(args.distance_event_km),
             near_km=float(args.distance_near_km),
             far_km=float(args.distance_far_km),
+            exclusion_window_hours=float(args.ibtracs_exclusion_window_hours),
         )
     else:
         samples["nearest_storm_distance_km"] = np.nan
         samples["nearest_storm_id"] = None
+        samples["nearest_storm_time_delta_h"] = np.nan
         samples["storm_distance_cohort"] = None
         samples["storm_phase"] = None
         samples["storm_dist_km"] = np.nan
+        samples["ib_sid"] = None
+        samples["ib_name"] = None
+        samples["ib_basin"] = None
+        samples["ib_dt_hours"] = np.nan
+        samples["ib_dist_km"] = np.nan
+        samples["ib_event"] = False
+        samples["ib_far"] = False
+        samples["ib_conflict_flag"] = None
+        samples["time_basis"] = "valid"
+        samples["t_valid"] = pd.to_datetime(samples["t"], errors="coerce")
 
     control_coverage = _compute_control_coverage(samples=samples)
     lead_case_counts = _lead_case_counts(samples=samples)
@@ -685,6 +716,11 @@ def main() -> int:
                 + ",".join(f"{lead}:{cnt}<{min_far}" for lead, cnt in sorted(missing.items()))
             )
 
+    ib_diag_df, ib_diag_summary = _build_ibtracs_alignment_diagnostics(
+        samples=samples,
+        case_manifest_all=case_manifest_all,
+    )
+
     samples.to_parquet(out_dir / "samples.parquet", index=False)
     eta_long = _build_eta_long(samples)
     eta_long.to_parquet(out_dir / "eta_long.parquet", index=False)
@@ -704,6 +740,11 @@ def main() -> int:
         track_summary_df.to_parquet(out_dir / "storm_track_summary.parquet", index=False)
     if ibtracs_match is not None:
         (out_dir / "ibtracs_match.json").write_text(json.dumps(ibtracs_match, indent=2, sort_keys=True), encoding="utf-8")
+    ib_diag_df.to_parquet(out_dir / "ibtracs_alignment_diagnostics.parquet", index=False)
+    (out_dir / "ibtracs_alignment_summary.json").write_text(
+        json.dumps(ib_diag_summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
     dataset_yaml = {
         "schema_version": 1,
@@ -761,6 +802,8 @@ def main() -> int:
             "distance_event_km": float(args.distance_event_km),
             "distance_near_km": float(args.distance_near_km),
             "distance_far_km": float(args.distance_far_km),
+            "ibtracs_exclusion_window_hours": float(args.ibtracs_exclusion_window_hours),
+            "time_basis": "valid",
         },
         "analysis": {
             "knee": {"method": "segmented", "rho": 1.5},
@@ -809,6 +852,7 @@ def main() -> int:
         "distance_event_km": float(args.distance_event_km),
         "distance_near_km": float(args.distance_near_km),
         "distance_far_km": float(args.distance_far_km),
+        "ibtracs_exclusion_window_hours": float(args.ibtracs_exclusion_window_hours),
         "physical_speed_bin_ms": float(args.physical_speed_bin_ms),
         "physical_zeta_bin": float(args.physical_zeta_bin),
         "min_distinct_scales_per_case": int(args.min_distinct_scales_per_case),
@@ -848,6 +892,10 @@ def main() -> int:
         "storm_track_summary_path": str((out_dir / "storm_track_summary.parquet").resolve()) if not track_summary_df.empty else None,
         "ibtracs_match": ibtracs_match,
         "ibtracs_catalog": ibtracs_catalog,
+        "ibtracs_index": ib_index_meta,
+        "ibtracs_alignment_diagnostics_path": str((out_dir / "ibtracs_alignment_diagnostics.parquet").resolve()),
+        "ibtracs_alignment_summary_path": str((out_dir / "ibtracs_alignment_summary.json").resolve()),
+        "ibtracs_alignment_summary": ib_diag_summary,
     }
     (out_dir / "build_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -2315,13 +2363,30 @@ def _build_eta_long(samples: pd.DataFrame) -> pd.DataFrame:
                 "O_R",
             ]
         )
+    time_col = "t" if "t" in samples.columns else ("t_valid" if "t_valid" in samples.columns else ("time" if "time" in samples.columns else None))
+    if time_col is None:
+        return pd.DataFrame(
+            columns=[
+                "case_id",
+                "case_type",
+                "control_tier",
+                "lead_bucket",
+                "t",
+                "L",
+                "omega",
+                "eta",
+                "eta_sign",
+                "O_L",
+                "O_R",
+            ]
+        )
     pivot = samples.pivot_table(
         index=[
             "case_id",
             "case_type",
             "control_tier",
             "lead_bucket",
-            "t",
+            time_col,
             "L",
             "omega",
         ],
@@ -2345,6 +2410,8 @@ def _build_eta_long(samples: pd.DataFrame) -> pd.DataFrame:
     eta_sign[valid] = np.sign(o_l[valid] - o_r[valid])
     pivot["eta"] = eta
     pivot["eta_sign"] = eta_sign
+    if time_col != "t":
+        pivot = pivot.rename(columns={time_col: "t"})
     return pivot.dropna(subset=["eta"]).reset_index(drop=True)
 
 
@@ -2425,42 +2492,139 @@ def _resolve_centers_mode(*, centers: str | None, event_source: str | None) -> s
     return str(centers or "hybrid").strip().lower()
 
 
+def _build_ibtracs_index(ib_points: pd.DataFrame):
+    if ib_points is None or ib_points.empty:
+        return None
+    ib = ib_points.copy()
+    if "time_utc" not in ib.columns:
+        if "time" in ib.columns:
+            ib["time_utc"] = pd.to_datetime(ib["time"], errors="coerce")
+        else:
+            return None
+    else:
+        ib["time_utc"] = pd.to_datetime(ib["time_utc"], errors="coerce")
+    if "sid" not in ib.columns:
+        if "storm_id" in ib.columns:
+            ib["sid"] = ib["storm_id"].astype(str)
+        else:
+            return None
+    if "lat" not in ib.columns:
+        if "lat0" in ib.columns:
+            ib["lat"] = pd.to_numeric(ib["lat0"], errors="coerce")
+        else:
+            return None
+    if "lon" not in ib.columns:
+        if "lon0" in ib.columns:
+            ib["lon"] = normalize_lon_180(pd.to_numeric(ib["lon0"], errors="coerce").to_numpy(dtype=float))
+        else:
+            return None
+    for col in ("name", "basin", "wind", "pres"):
+        if col not in ib.columns:
+            ib[col] = None
+    base = ib[["sid", "time_utc", "lat", "lon", "name", "basin", "wind", "pres"]].copy()
+    base = base.dropna(subset=["sid", "time_utc", "lat", "lon"]).reset_index(drop=True)
+    if base.empty:
+        return None
+    return build_track_index(base)
+
+
+def _ibtracs_index_meta(index: Any) -> dict[str, Any]:
+    if index is None:
+        return {"available": False}
+    pts = index.points if hasattr(index, "points") else pd.DataFrame()
+    if pts is None or pts.empty:
+        return {"available": False}
+    t = pd.to_datetime(pts.get("time_utc"), errors="coerce")
+    return {
+        "available": True,
+        "n_points": int(pts.shape[0]),
+        "n_sid": int(pts["sid"].astype(str).nunique()) if "sid" in pts.columns else 0,
+        "n_hour_buckets": int(len(getattr(index, "by_time", {}) or {})),
+        "time_min": str(t.min()) if t.notna().any() else None,
+        "time_max": str(t.max()) if t.notna().any() else None,
+    }
+
+
 def _annotate_cases_with_storm_distance(
     cases: list[dict[str, Any]],
     *,
-    ib_points_hourly: pd.DataFrame,
+    ib_index: Any,
     tolerance_hours: float,
     event_km: float,
     near_km: float,
     far_km: float,
+    exclusion_window_hours: float,
 ) -> list[dict[str, Any]]:
     if not cases:
         return cases
+    if ib_index is None:
+        return [dict(c) for c in cases]
     q = pd.DataFrame(
         {
             "case_id": [str(c.get("case_id")) for c in cases],
-            "time": [pd.Timestamp(c.get("time0")) for c in cases],
+            "source_time": [pd.Timestamp(c.get("time0")) for c in cases],
+            "lead_bucket": [str(c.get("lead_bucket")) for c in cases],
             "lat0": [pd.to_numeric(c.get("lat0"), errors="coerce") for c in cases],
             "lon0": [pd.to_numeric(c.get("lon0"), errors="coerce") for c in cases],
         }
     )
+    q["valid_time"] = [
+        _valid_time_from_components(time_value=row["source_time"], lead_bucket=row["lead_bucket"])
+        for _, row in q.iterrows()
+    ]
+    q["time"] = q["valid_time"]
     ann = _nearest_storm_lookup(
         queries=q,
-        ib_points_hourly=ib_points_hourly,
+        ib_index=ib_index,
         tolerance_hours=float(tolerance_hours),
+        exclusion_window_hours=float(exclusion_window_hours),
     )
     out: list[dict[str, Any]] = []
-    by_case = {str(r["case_id"]): r for r in ann.to_dict(orient="records")}
+    by_case = {(str(r["case_id"]), str(r.get("lead_bucket", ""))): r for r in ann.to_dict(orient="records")}
     for c in cases:
         cc = dict(c)
-        rec = by_case.get(str(cc.get("case_id")))
-        d = float(rec["nearest_storm_distance_km"]) if rec and np.isfinite(float(rec["nearest_storm_distance_km"])) else np.nan
+        key = (str(cc.get("case_id")), str(cc.get("lead_bucket", "")))
+        rec = by_case.get(key)
+        d = float(rec["nearest_storm_distance_km"]) if rec and np.isfinite(float(rec.get("nearest_storm_distance_km", np.nan))) else np.nan
+        dt_h = float(rec["nearest_storm_time_delta_h"]) if rec and np.isfinite(float(rec.get("nearest_storm_time_delta_h", np.nan))) else np.nan
+        min_dist_window = (
+            float(rec["nearest_storm_min_dist_window_km"])
+            if rec and np.isfinite(float(rec.get("nearest_storm_min_dist_window_km", np.nan)))
+            else np.nan
+        )
+        ib_event = bool(np.isfinite(d) and np.isfinite(dt_h) and d <= float(event_km) and dt_h <= float(tolerance_hours))
+        ib_far = bool(np.isfinite(min_dist_window) and min_dist_window >= float(far_km))
+        cohort = _distance_cohort_from_flags(
+            dist_km=d,
+            event_km=event_km,
+            near_km=near_km,
+            ib_event=ib_event,
+            ib_far=ib_far,
+        )
         cc["nearest_storm_distance_km"] = d
+        cc["nearest_storm_time_delta_h"] = dt_h
+        cc["nearest_storm_min_dist_window_km"] = min_dist_window
         cc["nearest_storm_id"] = rec.get("nearest_storm_id") if rec else None
-        cohort = _distance_cohort(d, event_km=event_km, near_km=near_km, far_km=far_km)
         cc["storm_distance_cohort"] = cohort
         cc["storm_phase"] = cohort
         cc["storm_dist_km"] = d
+        cc["time_basis"] = "valid"
+        cc["valid_time"] = rec.get("valid_time") if rec else _valid_time_from_components(cc.get("time0"), cc.get("lead_bucket"))
+        cc["ib_sid"] = rec.get("nearest_storm_id") if rec else None
+        cc["ib_name"] = rec.get("nearest_storm_name") if rec else None
+        cc["ib_basin"] = rec.get("nearest_storm_basin") if rec else None
+        cc["ib_dt_hours"] = dt_h
+        cc["ib_dist_km"] = d
+        cc["ib_event"] = bool(ib_event)
+        cc["ib_far"] = bool(ib_far)
+        cc["ib_conflict_flag"] = _ib_conflict_flag(
+            dist_km=d,
+            dt_hours=dt_h,
+            far_km=float(far_km),
+            dt_max_hours=float(tolerance_hours),
+            ib_event=ib_event,
+            ib_far=ib_far,
+        )
         if rec and rec.get("nearest_storm_id") is not None:
             cc["storm_id"] = str(rec.get("nearest_storm_id"))
         out.append(cc)
@@ -2470,39 +2634,79 @@ def _annotate_cases_with_storm_distance(
 def _annotate_samples_with_storm_distance(
     *,
     samples: pd.DataFrame,
-    ib_points_hourly: pd.DataFrame,
+    ib_index: Any,
     tolerance_hours: float,
     event_km: float,
     near_km: float,
     far_km: float,
+    exclusion_window_hours: float,
 ) -> pd.DataFrame:
     if samples.empty:
         return samples.copy()
     out = samples.copy()
+    out["t"] = pd.to_datetime(out["t"], errors="coerce")
+    out["t_valid"] = [
+        _valid_time_from_components(time_value=t, lead_bucket=lead)
+        for t, lead in zip(out["t"], out.get("lead_bucket", pd.Series([None] * len(out))), strict=False)
+    ]
+    out["time_basis"] = "valid"
+    if ib_index is None:
+        return out
     q = (
-        out[["case_id", "t", "lat0", "lon0"]]
-        .drop_duplicates(subset=["case_id", "t", "lat0", "lon0"])
-        .rename(columns={"t": "time"})
+        out[["case_id", "t_valid", "lead_bucket", "lat0", "lon0"]]
+        .drop_duplicates(subset=["case_id", "t_valid", "lead_bucket", "lat0", "lon0"])
+        .rename(columns={"t_valid": "time"})
         .reset_index(drop=True)
     )
     ann = _nearest_storm_lookup(
         queries=q,
-        ib_points_hourly=ib_points_hourly,
+        ib_index=ib_index,
         tolerance_hours=float(tolerance_hours),
+        exclusion_window_hours=float(exclusion_window_hours),
     )
     out = out.merge(
-        ann.rename(columns={"time": "t"}),
-        on=["case_id", "t", "lat0", "lon0"],
+        ann.rename(columns={"time": "t_valid"}),
+        on=["case_id", "t_valid", "lead_bucket", "lat0", "lon0"],
         how="left",
     )
+    out["ib_sid"] = out.get("nearest_storm_id")
+    out["ib_name"] = out.get("nearest_storm_name")
+    out["ib_basin"] = out.get("nearest_storm_basin")
+    out["ib_dt_hours"] = pd.to_numeric(out.get("nearest_storm_time_delta_h"), errors="coerce")
+    out["ib_dist_km"] = pd.to_numeric(out.get("nearest_storm_distance_km"), errors="coerce")
+    out["ib_event"] = (
+        np.isfinite(out["ib_dist_km"])
+        & np.isfinite(out["ib_dt_hours"])
+        & (out["ib_dist_km"] <= float(event_km))
+        & (out["ib_dt_hours"] <= float(tolerance_hours))
+    )
+    min_dist_window = pd.to_numeric(out.get("nearest_storm_min_dist_window_km"), errors="coerce")
+    out["ib_far"] = np.isfinite(min_dist_window) & (min_dist_window >= float(far_km))
+    out["ib_conflict_flag"] = [
+        _ib_conflict_flag(
+            dist_km=d,
+            dt_hours=dt,
+            far_km=float(far_km),
+            dt_max_hours=float(tolerance_hours),
+            ib_event=bool(ev),
+            ib_far=bool(far),
+        )
+        for d, dt, ev, far in zip(out["ib_dist_km"], out["ib_dt_hours"], out["ib_event"], out["ib_far"], strict=False)
+    ]
     out["storm_distance_cohort"] = [
-        _distance_cohort(
+        _distance_cohort_from_flags(
             float(v) if np.isfinite(float(v)) else np.nan,
             event_km=float(event_km),
             near_km=float(near_km),
-            far_km=float(far_km),
+            ib_event=bool(ev),
+            ib_far=bool(far),
         )
-        for v in pd.to_numeric(out["nearest_storm_distance_km"], errors="coerce").fillna(np.nan).to_numpy(dtype=float)
+        for v, ev, far in zip(
+            pd.to_numeric(out["nearest_storm_distance_km"], errors="coerce").fillna(np.nan).to_numpy(dtype=float),
+            out["ib_event"].to_numpy(dtype=bool),
+            out["ib_far"].to_numpy(dtype=bool),
+            strict=False,
+        )
     ]
     out["storm_phase"] = out["storm_distance_cohort"]
     out["storm_dist_km"] = pd.to_numeric(out["nearest_storm_distance_km"], errors="coerce")
@@ -2526,63 +2730,83 @@ def _annotate_samples_with_storm_distance(
 def _nearest_storm_lookup(
     *,
     queries: pd.DataFrame,
-    ib_points_hourly: pd.DataFrame,
+    ib_index: Any,
     tolerance_hours: float,
+    exclusion_window_hours: float,
 ) -> pd.DataFrame:
     q = queries.copy()
     q["time"] = pd.to_datetime(q["time"], errors="coerce")
     q = q.dropna(subset=["time", "lat0", "lon0"]).copy()
-    if q.empty or ib_points_hourly.empty:
+    if "lead_bucket" not in q.columns:
+        q["lead_bucket"] = ""
+    if q.empty or ib_index is None:
         q["nearest_storm_distance_km"] = np.nan
+        q["nearest_storm_time_delta_h"] = np.nan
+        q["nearest_storm_min_dist_window_km"] = np.nan
         q["nearest_storm_id"] = None
+        q["nearest_storm_name"] = None
+        q["nearest_storm_basin"] = None
         return q
-
-    ib = ib_points_hourly.copy()
-    ib["time"] = pd.to_datetime(ib["time"], errors="coerce").dt.floor("h")
-    ib = ib.dropna(subset=["time", "lat0", "lon0", "storm_id"]).copy()
-    if ib.empty:
-        q["nearest_storm_distance_km"] = np.nan
-        q["nearest_storm_id"] = None
-        return q
-
-    ib_by_time: dict[pd.Timestamp, pd.DataFrame] = {
-        pd.Timestamp(t): g[["lat0", "lon0", "storm_id"]].copy()
-        for t, g in ib.groupby("time", sort=False)
-    }
-    offsets_h = int(np.ceil(max(float(tolerance_hours), 0.0)))
 
     nearest_dist: list[float] = []
+    nearest_dt: list[float] = []
     nearest_sid: list[str | None] = []
+    nearest_name: list[str | None] = []
+    nearest_basin: list[str | None] = []
+    min_dist_window: list[float] = []
     for _, row in q.iterrows():
-        t0 = pd.Timestamp(row["time"]).floor("h")
-        parts: list[pd.DataFrame] = []
-        for h in range(-offsets_h, offsets_h + 1):
-            tk = t0 + pd.Timedelta(hours=h)
-            g = ib_by_time.get(tk)
-            if g is not None and not g.empty:
-                parts.append(g)
-        if not parts:
-            nearest_dist.append(np.nan)
-            nearest_sid.append(None)
-            continue
-        cand = pd.concat(parts, ignore_index=True)
-        dist = haversine_km_vec(
-            float(row["lat0"]),
-            float(row["lon0"]),
-            cand["lat0"].to_numpy(dtype=float),
-            cand["lon0"].to_numpy(dtype=float),
+        hit = nearest_ibtracs_fix(
+            ib_index,
+            time=pd.Timestamp(row["time"]),
+            lat=float(row["lat0"]),
+            lon=float(row["lon0"]),
+            dt_max_hours=float(tolerance_hours),
+            r_max_km=None,
         )
-        if dist.size == 0 or not np.any(np.isfinite(dist)):
+        if hit is None:
             nearest_dist.append(np.nan)
+            nearest_dt.append(np.nan)
             nearest_sid.append(None)
-            continue
-        idx = int(np.nanargmin(dist))
-        nearest_dist.append(float(dist[idx]))
-        nearest_sid.append(str(cand.iloc[idx]["storm_id"]))
+            nearest_name.append(None)
+            nearest_basin.append(None)
+        else:
+            nearest_dist.append(float(hit.get("dist_km", np.nan)))
+            nearest_dt.append(float(hit.get("dt_hours", np.nan)))
+            nearest_sid.append(str(hit.get("sid")) if hit.get("sid") is not None else None)
+            nearest_name.append(str(hit.get("name")) if hit.get("name") is not None else None)
+            nearest_basin.append(str(hit.get("basin")) if hit.get("basin") is not None else None)
+        min_dist_window.append(
+            _min_storm_distance_within_window(
+                ib_index=ib_index,
+                time=pd.Timestamp(row["time"]),
+                lat=float(row["lat0"]),
+                lon=float(row["lon0"]),
+                window_hours=float(exclusion_window_hours),
+            )
+        )
 
     q["nearest_storm_distance_km"] = nearest_dist
+    q["nearest_storm_time_delta_h"] = nearest_dt
+    q["nearest_storm_min_dist_window_km"] = min_dist_window
     q["nearest_storm_id"] = nearest_sid
+    q["nearest_storm_name"] = nearest_name
+    q["nearest_storm_basin"] = nearest_basin
     return q
+
+
+def _distance_cohort_from_flags(
+    dist_km: float,
+    *,
+    event_km: float,
+    near_km: float,
+    ib_event: bool,
+    ib_far: bool,
+) -> str:
+    if bool(ib_event):
+        return "event"
+    if bool(ib_far):
+        return "far_nonstorm"
+    return _distance_cohort(dist_km, event_km=event_km, near_km=near_km, far_km=np.inf)
 
 
 def _distance_cohort(d_km: float, *, event_km: float, near_km: float, far_km: float) -> str:
@@ -2596,6 +2820,164 @@ def _distance_cohort(d_km: float, *, event_km: float, near_km: float, far_km: fl
     if d >= float(far_km):
         return "far_nonstorm"
     return "transition"
+
+
+def _lead_hours(lead_bucket: Any) -> float:
+    text = str(lead_bucket).strip().lower()
+    if text in {"", "none", "nan", "null"}:
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        return 0.0
+
+
+def _valid_time_from_components(time_value: Any, lead_bucket: Any) -> pd.Timestamp:
+    t = pd.to_datetime(time_value, errors="coerce")
+    if pd.isna(t):
+        return pd.NaT
+    return pd.Timestamp(t) + pd.Timedelta(hours=_lead_hours(lead_bucket))
+
+
+def _min_storm_distance_within_window(
+    *,
+    ib_index: Any,
+    time: pd.Timestamp,
+    lat: float,
+    lon: float,
+    window_hours: float,
+) -> float:
+    if ib_index is None or pd.isna(time):
+        return np.nan
+    by_time = getattr(ib_index, "by_time", {}) or {}
+    if not by_time:
+        return np.nan
+    t0 = pd.Timestamp(time).floor("h")
+    offsets = int(np.ceil(max(float(window_hours), 0.0)))
+    best = np.inf
+    lon_q = float(normalize_lon_180(lon))
+    for h in range(-offsets, offsets + 1):
+        g = by_time.get(t0 + pd.Timedelta(hours=h))
+        if g is None or g.empty:
+            continue
+        dist = haversine_km_vec(
+            float(lat),
+            lon_q,
+            pd.to_numeric(g["lat"], errors="coerce").to_numpy(dtype=float),
+            normalize_lon_180(pd.to_numeric(g["lon"], errors="coerce").to_numpy(dtype=float)),
+        )
+        if dist.size == 0:
+            continue
+        dmin = float(np.nanmin(dist))
+        if np.isfinite(dmin):
+            best = min(best, dmin)
+    return float(best) if np.isfinite(best) else np.nan
+
+
+def _ib_conflict_flag(
+    *,
+    dist_km: float,
+    dt_hours: float,
+    far_km: float,
+    dt_max_hours: float,
+    ib_event: bool,
+    ib_far: bool,
+) -> str | None:
+    d_ok = np.isfinite(float(dist_km))
+    t_ok = np.isfinite(float(dt_hours))
+    if not d_ok or not t_ok:
+        return "missing_match"
+    d = float(dist_km)
+    t = float(dt_hours)
+    if bool(ib_event) and bool(ib_far):
+        return "event_far_overlap"
+    if d <= float(far_km) and t > float(dt_max_hours):
+        return "spatial_near_time_far"
+    if t <= float(dt_max_hours) and d > float(far_km):
+        return "time_near_spatial_far"
+    return None
+
+
+def _build_ibtracs_alignment_diagnostics(
+    *,
+    samples: pd.DataFrame,
+    case_manifest_all: list[dict[str, Any]],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if samples.empty:
+        return pd.DataFrame(), {"n_cases": 0, "available": False}
+    frame = samples.copy()
+    for col in ("ib_event", "ib_far"):
+        frame[col] = pd.to_numeric(frame.get(col), errors="coerce").fillna(0).astype(int)
+    if "ib_dist_km" not in frame.columns:
+        frame["ib_dist_km"] = pd.to_numeric(frame.get("nearest_storm_distance_km"), errors="coerce")
+    if "ib_dt_hours" not in frame.columns:
+        frame["ib_dt_hours"] = pd.to_numeric(frame.get("nearest_storm_time_delta_h"), errors="coerce")
+    agg: dict[str, tuple[str, str]] = {
+        "lead_bucket": ("lead_bucket", "first"),
+        "case_type": ("case_type", "first"),
+        "storm_id": ("storm_id", "first"),
+        "lat0": ("lat0", "median"),
+        "lon0": ("lon0", "median"),
+        "time_basis": ("time_basis", "first"),
+        "internal_storm": ("storm", "max"),
+        "internal_near": ("near_storm", "max"),
+        "internal_pregen": ("pregen", "max"),
+        "ib_sid": ("ib_sid", "first"),
+        "ib_name": ("ib_name", "first"),
+        "ib_basin": ("ib_basin", "first"),
+        "ib_dist_km": ("ib_dist_km", "median"),
+        "ib_dt_hours": ("ib_dt_hours", "median"),
+        "ib_event": ("ib_event", "max"),
+        "ib_far": ("ib_far", "max"),
+        "ib_conflict_flag": ("ib_conflict_flag", "first"),
+    }
+    time_col = "t" if "t" in frame.columns else ("time" if "time" in frame.columns else None)
+    if time_col:
+        agg["t"] = (time_col, "median")
+    if "t_valid" in frame.columns:
+        agg["t_valid"] = ("t_valid", "median")
+    agg = {k: v for k, v in agg.items() if v[0] in frame.columns}
+    grp = frame.groupby("case_id", as_index=False).agg(**agg)
+    grp["internal_event"] = (pd.to_numeric(grp["internal_storm"], errors="coerce").fillna(0) > 0).astype(int)
+    grp["internal_far"] = (
+        (pd.to_numeric(grp["internal_storm"], errors="coerce").fillna(0) == 0)
+        & (pd.to_numeric(grp["internal_near"], errors="coerce").fillna(0) == 0)
+        & (pd.to_numeric(grp["internal_pregen"], errors="coerce").fillna(0) == 0)
+    ).astype(int)
+    grp["ib_event"] = (pd.to_numeric(grp["ib_event"], errors="coerce").fillna(0) > 0).astype(int)
+    grp["ib_far"] = (pd.to_numeric(grp["ib_far"], errors="coerce").fillna(0) > 0).astype(int)
+
+    case_meta = pd.DataFrame(case_manifest_all) if case_manifest_all else pd.DataFrame()
+    if not case_meta.empty and "case_id" in case_meta.columns:
+        case_meta = case_meta.copy()
+        case_meta["case_id"] = case_meta["case_id"].astype(str)
+        keep_cols = [c for c in ("case_id", "center_source", "event_label", "control_tier", "match_quality") if c in case_meta.columns]
+        if keep_cols:
+            grp = grp.merge(case_meta[keep_cols].drop_duplicates(subset=["case_id"]), on="case_id", how="left")
+
+    worst_internal_event_ib_far = grp.loc[(grp["internal_event"] == 1) & (grp["ib_event"] == 0)].copy()
+    worst_internal_event_ib_far = worst_internal_event_ib_far.sort_values(["ib_dist_km", "ib_dt_hours"], ascending=[False, False]).head(20)
+    worst_internal_far_ib_event = grp.loc[(grp["internal_far"] == 1) & (grp["ib_event"] == 1)].copy()
+    worst_internal_far_ib_event = worst_internal_far_ib_event.sort_values(["ib_dist_km", "ib_dt_hours"], ascending=[True, True]).head(20)
+
+    summary = {
+        "available": True,
+        "n_cases": int(grp.shape[0]),
+        "internal_event_vs_ib_event": pd.crosstab(grp["internal_event"], grp["ib_event"]).to_dict(),
+        "internal_far_vs_ib_far": pd.crosstab(grp["internal_far"], grp["ib_far"]).to_dict(),
+        "ib_conflict_flag_counts": grp.get("ib_conflict_flag", pd.Series(dtype=object)).fillna("none").value_counts(dropna=False).to_dict(),
+        "ib_event_case_count": int((grp["ib_event"] == 1).sum()),
+        "ib_far_case_count": int((grp["ib_far"] == 1).sum()),
+        "internal_event_case_count": int((grp["internal_event"] == 1).sum()),
+        "internal_far_case_count": int((grp["internal_far"] == 1).sum()),
+        "worst_internal_event_ib_far": worst_internal_event_ib_far[
+            [c for c in ("case_id", "lead_bucket", "t_valid", "lat0", "lon0", "ib_sid", "ib_dist_km", "ib_dt_hours", "center_source") if c in worst_internal_event_ib_far.columns]
+        ].to_dict(orient="records"),
+        "worst_internal_far_ib_event": worst_internal_far_ib_event[
+            [c for c in ("case_id", "lead_bucket", "t_valid", "lat0", "lon0", "ib_sid", "ib_dist_km", "ib_dt_hours", "center_source") if c in worst_internal_far_ib_event.columns]
+        ].to_dict(orient="records"),
+    }
+    return grp.reset_index(drop=True), summary
 
 
 def _count_values(rows: list[dict[str, Any]], key: str) -> dict[str, int]:

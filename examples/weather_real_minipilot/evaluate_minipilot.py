@@ -296,6 +296,30 @@ def parse_args() -> argparse.Namespace:
         help="Maximum |time delta| hours for strict IBTrACS event slice when time-delta column is available",
     )
     parser.add_argument(
+        "--ibtracs-alignment-min-event-cases",
+        type=int,
+        default=5,
+        help="Minimum strict IBTrACS event cases required for alignment gate",
+    )
+    parser.add_argument(
+        "--ibtracs-alignment-min-far-cases",
+        type=int,
+        default=5,
+        help="Minimum strict IBTrACS far-control cases required for alignment gate",
+    )
+    parser.add_argument(
+        "--ibtracs-alignment-margin-min",
+        type=float,
+        default=0.0,
+        help="Minimum strict IBTrACS event-minus-far parity margin required for alignment gate",
+    )
+    parser.add_argument(
+        "--ibtracs-alignment-confound-max",
+        type=float,
+        default=1.0,
+        help="Maximum strict IBTrACS confound ratio allowed for alignment gate",
+    )
+    parser.add_argument(
         "--claim-contract-schema-version",
         type=int,
         default=1,
@@ -740,6 +764,23 @@ def main() -> int:
         required=bool(vortex_centered),
     )
     summary["angular_witness"] = angular_witness
+    ibtracs_strict_eval = _build_ibtracs_strict_eval(
+        case_metrics=claim_test_metrics,
+        samples=claim_test_df,
+        radius_km=float(args.ibtracs_strict_radius_km),
+        far_min_km=float(args.ibtracs_strict_far_min_km),
+        time_hours=float(args.ibtracs_strict_time_hours),
+        p_lock_threshold=float(args.p_lock_threshold),
+    )
+    summary["ibtracs_strict_eval"] = ibtracs_strict_eval
+    ibtracs_alignment_gate = _build_ibtracs_alignment_gate(
+        strict_eval=ibtracs_strict_eval,
+        min_event_cases=int(args.ibtracs_alignment_min_event_cases),
+        min_far_cases=int(args.ibtracs_alignment_min_far_cases),
+        margin_min=float(args.ibtracs_alignment_margin_min),
+        confound_max=float(args.ibtracs_alignment_confound_max),
+    )
+    summary["ibtracs_alignment_gate"] = ibtracs_alignment_gate
     claim_reason_codes: list[str] = []
     if not anomaly_mode_gate.get("passed", False):
         claim_reason_codes.append("anomaly_canonical_fail")
@@ -749,6 +790,8 @@ def main() -> int:
         claim_reason_codes.append("mode_null_fail")
     if not angular_witness.get("gate", {}).get("passed", False):
         claim_reason_codes.append("non_angular_signal")
+    if not ibtracs_alignment_gate.get("passed", False):
+        claim_reason_codes.append("ibtracs_alignment_fail")
     if claim_reason_codes:
         claim_mode = "invalid"
     else:
@@ -762,12 +805,14 @@ def main() -> int:
             or (not parity_confound_gate.get("passed", False))
             or (not geometry_null_collapse.get("passed", False))
             or (not angular_witness.get("gate", {}).get("passed", False))
+            or (not ibtracs_alignment_gate.get("passed", False))
         ),
         "reasons": [
             *([] if anomaly_mode_gate.get("passed", False) else ["anomaly_canonical_fail"]),
             *([] if parity_confound_gate.get("passed", False) else ["parity_confound_high"]),
             *([] if geometry_null_collapse.get("passed", False) else ["geometry_nulls_do_not_collapse_signal"]),
             *([] if angular_witness.get("gate", {}).get("passed", False) else ["angular_witness_fail"]),
+            *([] if ibtracs_alignment_gate.get("passed", False) else ["ibtracs_alignment_fail"]),
         ],
     }
 
@@ -825,15 +870,6 @@ def main() -> int:
     )
     summary["parity_confound_dashboard_summary"] = confound_summary
     summary["parity_breakdown"] = _build_parity_breakdown(confound_df, axis_meta=axis_meta)
-    ibtracs_strict_eval = _build_ibtracs_strict_eval(
-        case_metrics=claim_test_metrics,
-        samples=claim_test_df,
-        radius_km=float(args.ibtracs_strict_radius_km),
-        far_min_km=float(args.ibtracs_strict_far_min_km),
-        time_hours=float(args.ibtracs_strict_time_hours),
-        p_lock_threshold=float(args.p_lock_threshold),
-    )
-    summary["ibtracs_strict_eval"] = ibtracs_strict_eval
 
     ablation_path = out_path.with_name("parity_ablation.json")
     ablation_path.parent.mkdir(parents=True, exist_ok=True)
@@ -871,6 +907,9 @@ def main() -> int:
     ibtracs_strict_path = out_path.with_name("ibtracs_strict_eval.json")
     ibtracs_strict_path.write_text(json.dumps(ibtracs_strict_eval, indent=2, sort_keys=True), encoding="utf-8")
     summary["ibtracs_strict_eval_path"] = str(ibtracs_strict_path.resolve())
+    ibtracs_alignment_path = out_path.with_name("ibtracs_alignment_gate.json")
+    ibtracs_alignment_path.write_text(json.dumps(ibtracs_alignment_gate, indent=2, sort_keys=True), encoding="utf-8")
+    summary["ibtracs_alignment_gate_path"] = str(ibtracs_alignment_path.resolve())
 
     claim_contract = _build_claim_contract(
         summary=summary,
@@ -4008,6 +4047,8 @@ def _build_knee_strategy_summary(case_metrics: pd.DataFrame) -> dict[str, Any]:
             "tf_knee_rate": 0.0,
             "effective_knee_rate": 0.0,
             "recommended_primary": "tf",
+            "size_knee_role": "secondary_conditional",
+            "size_knee_claimable": False,
             "notes": ["no_cases"],
         }
     size = (
@@ -4031,14 +4072,22 @@ def _build_knee_strategy_summary(case_metrics: pd.DataFrame) -> dict[str, Any]:
     eff_rate = float(eff.mean()) if n else 0.0
     both = int((size & tf).sum())
     any_knee = int((size | tf).sum())
-    recommended = "tf" if (tf_rate >= size_rate) else "size"
+    cand_prop = pd.to_numeric(case_metrics.get("knee_candidate_count_proposed"), errors="coerce")
+    cand_sanity = pd.to_numeric(case_metrics.get("knee_candidate_count_sanity_pass"), errors="coerce")
+    size_candidate_rate = float((cand_prop.fillna(0) > 0).mean()) if not cand_prop.empty else 0.0
+    size_sanity_rate = float((cand_sanity.fillna(0) > 0).mean()) if not cand_sanity.empty else 0.0
+    # Weather policy: TF-knee is primary; size-knee is only claimable when curve support is sufficiently stable.
+    size_claimable = bool(
+        (size_candidate_rate >= 0.50)
+        and (size_sanity_rate >= 0.30)
+        and (size_rate > 0.0)
+    )
     notes: list[str] = []
-    if size_rate < 0.15 and tf_rate > 0.0:
-        notes.append("size_knee_sparse_tf_primary_recommended")
-    if tf_rate < 0.15 and size_rate >= 0.15:
-        notes.append("tf_knee_sparse_size_primary_recommended")
-    if not notes:
-        notes.append("dual_knee_reporting_recommended")
+    notes.append("weather_policy_tf_primary")
+    if not size_claimable:
+        notes.append("size_knee_diagnostic_only_under_current_scale_support")
+    if tf_rate <= 0.0:
+        notes.append("tf_knee_not_detected")
     return {
         "n_cases": n,
         "size_knee_rate": size_rate,
@@ -4046,7 +4095,11 @@ def _build_knee_strategy_summary(case_metrics: pd.DataFrame) -> dict[str, Any]:
         "effective_knee_rate": eff_rate,
         "both_knees_rate": float(both / n) if n else 0.0,
         "knee_agreement_rate": float(both / max(1, any_knee)),
-        "recommended_primary": recommended,
+        "recommended_primary": "tf",
+        "size_knee_role": "secondary_conditional",
+        "size_knee_claimable": bool(size_claimable),
+        "size_candidate_rate": float(size_candidate_rate),
+        "size_sanity_rate": float(size_sanity_rate),
         "notes": notes,
     }
 
@@ -4415,6 +4468,47 @@ def _safe_median(series: pd.Series | Any) -> float | None:
     return float(np.median(vals))
 
 
+def _summary_numeric(values: Any) -> dict[str, float] | None:
+    try:
+        arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    except Exception:
+        return None
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    return {
+        "n": int(arr.size),
+        "min": float(np.min(arr)),
+        "p05": float(np.quantile(arr, 0.05)),
+        "p25": float(np.quantile(arr, 0.25)),
+        "p50": float(np.quantile(arr, 0.50)),
+        "p75": float(np.quantile(arr, 0.75)),
+        "p95": float(np.quantile(arr, 0.95)),
+        "max": float(np.max(arr)),
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr, ddof=0)),
+    }
+
+
+def _summary_hist(values: Any, *, bins: list[float]) -> dict[str, Any] | None:
+    try:
+        arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    except Exception:
+        return None
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    edges = np.asarray(bins, dtype=float)
+    if edges.size < 2:
+        return None
+    hist, bin_edges = np.histogram(arr, bins=edges)
+    return {
+        "bins": [float(v) for v in bin_edges.tolist()],
+        "counts": [int(v) for v in hist.tolist()],
+        "n": int(arr.size),
+    }
+
+
 def _cv(values: list[float]) -> float | None:
     arr = np.asarray(values, dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -4442,10 +4536,22 @@ def _build_ibtracs_strict_eval(
     case_df["case_id"] = case_df["case_id"].astype(str)
 
     # Fill distance/time metadata from samples if missing in case_metrics.
-    meta_cols = [c for c in ("case_id", "nearest_storm_distance_km") if c in samples.columns]
+    dist_col_candidates = [
+        c
+        for c in (
+            "ib_dist_km",
+            "nearest_storm_distance_km",
+            "storm_dist_km",
+        )
+        if c in samples.columns
+    ]
+    meta_cols = [c for c in ("case_id",) if c in samples.columns]
+    if dist_col_candidates:
+        meta_cols.append(dist_col_candidates[0])
     time_delta_candidates = [
         c
         for c in (
+            "ib_dt_hours",
             "nearest_storm_time_delta_h",
             "nearest_storm_time_delta_hours",
             "storm_time_delta_h",
@@ -4469,7 +4575,7 @@ def _build_ibtracs_strict_eval(
             .groupby("case_id", as_index=False)
             .agg(
                 {
-                    **({"nearest_storm_distance_km": "median"} if "nearest_storm_distance_km" in meta_cols else {}),
+                    **({dist_col_candidates[0]: "median"} if dist_col_candidates else {}),
                     **({time_delta_candidates[0]: "median"} if time_delta_candidates else {}),
                     **({"storm_id_nearest": "first"} if "storm_id_nearest" in meta_cols else {}),
                     **({"storm_id": "first"} if "storm_id" in meta_cols else {}),
@@ -4478,7 +4584,8 @@ def _build_ibtracs_strict_eval(
         )
         case_df = case_df.merge(meta, on="case_id", how="left", suffixes=("", "_sample"))
 
-    dist = pd.to_numeric(case_df.get("nearest_storm_distance_km"), errors="coerce")
+    dist_case_col = dist_col_candidates[0] if dist_col_candidates else "nearest_storm_distance_km"
+    dist = pd.to_numeric(case_df.get(dist_case_col), errors="coerce")
     if dist.isna().all():
         return {"available": False, "reason": "missing_nearest_storm_distance_km"}
 
@@ -4495,6 +4602,7 @@ def _build_ibtracs_strict_eval(
             "reason": "insufficient_strict_or_far_cases",
             "n_event_cases": int(event_df.shape[0]),
             "n_far_cases": int(far_df.shape[0]),
+            "dist_km_summary": _summary_numeric(dist),
         }
 
     event_summary = _aggregate_case_metrics(event_df, p_lock_threshold=float(p_lock_threshold))
@@ -4525,7 +4633,145 @@ def _build_ibtracs_strict_eval(
         "far_controls": far_summary,
         "event_minus_far_parity_rate": float(event_rate - far_rate),
         "confound_rate": float(far_rate / max(event_rate, 1e-9)),
+        "distance_col_used": str(dist_case_col),
+        "time_col_used": str(time_delta_candidates[0]) if time_delta_candidates else None,
+        "dist_km_summary": _summary_numeric(dist),
+        "dt_hours_summary": (
+            _summary_numeric(pd.to_numeric(case_df.get(time_delta_candidates[0]), errors="coerce").abs())
+            if time_delta_candidates
+            else None
+        ),
+        "dist_km_hist": _summary_hist(dist, bins=[0, 100, 300, 500, 800, 1200, 2000, 4000, 8000, 16000]),
+        "dt_hours_hist": (
+            _summary_hist(
+                pd.to_numeric(case_df.get(time_delta_candidates[0]), errors="coerce").abs(),
+                bins=[0, 1, 3, 6, 12, 24, 48, 96],
+            )
+            if time_delta_candidates
+            else None
+        ),
         "by_lead": by_lead,
+    }
+
+
+def _build_ibtracs_alignment_gate(
+    *,
+    strict_eval: dict[str, Any],
+    min_event_cases: int,
+    min_far_cases: int,
+    margin_min: float,
+    confound_max: float,
+) -> dict[str, Any]:
+    info = strict_eval or {}
+    reasons: list[str] = []
+    available = bool(info.get("available", False))
+    n_event = int(info.get("n_event_cases", 0) or 0)
+    n_far = int(info.get("n_far_cases", 0) or 0)
+    margin = _to_float(info.get("event_minus_far_parity_rate"))
+    confound = _to_float(info.get("confound_rate"))
+    time_hours = _to_float(info.get("time_hours")) or 0.0
+    radius_km = _to_float(info.get("radius_km")) or 0.0
+    dist_summary = info.get("dist_km_summary") if isinstance(info.get("dist_km_summary"), dict) else None
+    dt_summary = info.get("dt_hours_summary") if isinstance(info.get("dt_hours_summary"), dict) else None
+    dist_p50 = _to_float((dist_summary or {}).get("p50")) if dist_summary else None
+    dist_p95 = _to_float((dist_summary or {}).get("p95")) if dist_summary else None
+    dist_p05 = _to_float((dist_summary or {}).get("p05")) if dist_summary else None
+    dist_max = _to_float((dist_summary or {}).get("max")) if dist_summary else None
+    dt_p50 = _to_float((dt_summary or {}).get("p50")) if dt_summary else None
+    dt_p95 = _to_float((dt_summary or {}).get("p95")) if dt_summary else None
+
+    suspect_time_basis = bool(
+        (dt_p50 is not None)
+        and (time_hours > 0.0)
+        and (dt_p50 >= 0.75 * time_hours)
+        and (margin is None or margin < float(margin_min))
+    )
+    suspect_distance_units = bool(
+        ((dist_p50 is not None) and (dist_p50 > 8_000.0))
+        or ((dist_max is not None) and (dist_max < 5.0) and n_event > 0)
+    )
+    suspect_lon_wrap = bool(
+        (dist_p95 is not None)
+        and (dist_p05 is not None)
+        and (dist_p95 > 6_000.0)
+        and (dist_p05 < 500.0)
+    )
+    suspect_center_mismatch = bool(
+        (dist_p50 is not None)
+        and (radius_km > 0.0)
+        and (dist_p50 > 1.5 * radius_km)
+        and (margin is None or margin < float(margin_min))
+    )
+
+    if not available:
+        reasons.append(str(info.get("reason") or "strict_overlay_unavailable"))
+    if n_event < int(min_event_cases):
+        reasons.append(f"too_few_ibtracs_event_cases:{n_event}<{int(min_event_cases)}")
+    if n_far < int(min_far_cases):
+        reasons.append(f"too_few_ibtracs_far_cases:{n_far}<{int(min_far_cases)}")
+    if margin is None:
+        reasons.append("missing_event_minus_far_margin")
+    elif margin < float(margin_min):
+        reasons.append(f"negative_or_low_margin:{margin:.6f}<{float(margin_min):.6f}")
+    if confound is None:
+        reasons.append("missing_confound_rate")
+    elif confound > float(confound_max):
+        reasons.append(f"confound_exceeds_max:{confound:.6f}>{float(confound_max):.6f}")
+    if suspect_time_basis:
+        reasons.append("time_basis_mismatch_suspected")
+    if suspect_distance_units:
+        reasons.append("distance_units_suspected")
+    if suspect_lon_wrap:
+        reasons.append("lon_wrap_suspected")
+    if suspect_center_mismatch:
+        reasons.append("center_definition_mismatch")
+    passed = bool(len(reasons) == 0)
+    actions: list[str] = []
+    if not passed:
+        if any("too_few_ibtracs_event_cases" in r or "too_few_ibtracs_far_cases" in r for r in reasons):
+            actions.append("increase_strict_overlay_coverage_or_adjust_split")
+        if any("margin" in r or "confound" in r for r in reasons):
+            actions.append("audit_ibtracs_join_time_tolerance_lon_wrap_and_event_radius")
+            actions.append("verify_event_vs_far_cohort_definition_and_distance_thresholds")
+        if any("time_basis_mismatch_suspected" in r for r in reasons):
+            actions.append("use_valid_time_for_ibtracs_matching")
+        if any("distance_units_suspected" in r for r in reasons):
+            actions.append("audit_distance_units_and_haversine_inputs")
+        if any("lon_wrap_suspected" in r for r in reasons):
+            actions.append("normalize_longitudes_to_minus180_180_before_matching")
+        if any("center_definition_mismatch" in r for r in reasons):
+            actions.append("calibrate_vortex_center_definition_against_ibtracs")
+    return {
+        "passed": bool(passed),
+        "available": bool(available),
+        "n_event_cases": int(n_event),
+        "n_far_cases": int(n_far),
+        "event_minus_far_parity_rate": margin,
+        "confound_rate": confound,
+        "thresholds": {
+            "min_event_cases": int(min_event_cases),
+            "min_far_cases": int(min_far_cases),
+            "margin_min": float(margin_min),
+            "confound_max": float(confound_max),
+        },
+        "diagnostics": {
+            "dist_km_summary": dist_summary,
+            "dt_hours_summary": dt_summary,
+            "dist_km_hist": info.get("dist_km_hist"),
+            "dt_hours_hist": info.get("dt_hours_hist"),
+            "distance_col_used": info.get("distance_col_used"),
+            "time_col_used": info.get("time_col_used"),
+            "time_hours": float(time_hours),
+            "radius_km": float(radius_km),
+            "suspect_flags": {
+                "time_basis_mismatch_suspected": bool(suspect_time_basis),
+                "distance_units_suspected": bool(suspect_distance_units),
+                "lon_wrap_suspected": bool(suspect_lon_wrap),
+                "center_definition_mismatch": bool(suspect_center_mismatch),
+            },
+        },
+        "reason_codes": reasons,
+        "actions": actions,
     }
 
 
@@ -4649,6 +4895,16 @@ def _build_claim_contract(
                 "null_abs_drop_min": float(getattr(args, "angular_witness_null_abs_drop_min", 0.0)),
                 "null_margin_max": float(getattr(args, "angular_witness_null_margin_max", 0.0)),
             },
+            "ibtracs_alignment": {
+                "min_event_cases": int(getattr(args, "ibtracs_alignment_min_event_cases", 0)),
+                "min_far_cases": int(getattr(args, "ibtracs_alignment_min_far_cases", 0)),
+                "margin_min": float(getattr(args, "ibtracs_alignment_margin_min", 0.0)),
+                "confound_max": float(getattr(args, "ibtracs_alignment_confound_max", 1.0)),
+            },
+        },
+        "knee_policy": {
+            "primary": "tf",
+            "size_role": "secondary_conditional",
         },
         "evaluation_output": str(out_path.resolve()),
         "command": _build_eval_command_tokens(args, out_path=out_path),
@@ -4691,7 +4947,7 @@ def _validate_claim_contract(contract: dict[str, Any]) -> list[str]:
     if not isinstance(thresholds, dict):
         errors.append("thresholds_not_dict")
     else:
-        for gate in ("parity_confound_gate", "anomaly_gate", "geometry_null_collapse", "angular_witness"):
+        for gate in ("parity_confound_gate", "anomaly_gate", "geometry_null_collapse", "angular_witness", "ibtracs_alignment"):
             if gate not in thresholds:
                 errors.append(f"missing:thresholds.{gate}")
     command = contract.get("command")
