@@ -180,10 +180,24 @@ def build_track_index(
             frame = frame.loc[frame["basin"].astype(str).str.upper().isin(basin_set)].copy()
 
     frame["time_hour"] = pd.to_datetime(frame["time_utc"], errors="coerce").dt.floor("h")
-    by_time = {
-        pd.Timestamp(t): g[["sid", "time_utc", "lat", "lon", *[c for c in ("name", "basin", "wind", "pres") if c in g.columns]]].copy()
-        for t, g in frame.groupby("time_hour", sort=False)
-    }
+    optional_cols = [
+        c
+        for c in (
+            "name",
+            "basin",
+            "wind",
+            "pres",
+            "speed_kmh",
+            "dt_to_nearest_ib_hours",
+            "interp_flag",
+            "center_uncert_km",
+            "source_wind_col",
+            "source_pres_col",
+        )
+        if c in frame.columns
+    ]
+    keep_cols = ["sid", "time_utc", "lat", "lon", *optional_cols]
+    by_time = {pd.Timestamp(t): g[keep_cols].copy() for t, g in frame.groupby("time_hour", sort=False)}
     frame = frame.drop(columns=["time_hour"], errors="ignore").reset_index(drop=True)
     return IBTracsTrackIndex(points=frame, by_time=by_time, lon_convention="[-180,180)")
 
@@ -196,6 +210,7 @@ def nearest_ibtracs_fix(
     lon: float,
     dt_max_hours: float = 3.0,
     r_max_km: float | None = None,
+    use_fix_uncertainty: bool = True,
 ) -> dict[str, Any] | None:
     if index is None or index.points.empty or not index.by_time:
         return None
@@ -217,7 +232,11 @@ def nearest_ibtracs_fix(
         return None
     lon_q = float(normalize_lon_180(lon))
     dist = haversine_km_vec(float(lat), lon_q, cand["lat"].to_numpy(dtype=float), normalize_lon_180(cand["lon"].to_numpy(dtype=float)))
-    dt = np.abs((pd.to_datetime(cand["time_utc"], errors="coerce") - pd.Timestamp(time)).dt.total_seconds().to_numpy(dtype=float) / 3600.0)
+    dt_query = np.abs((pd.to_datetime(cand["time_utc"], errors="coerce") - pd.Timestamp(time)).dt.total_seconds().to_numpy(dtype=float) / 3600.0)
+    dt = np.array(dt_query, dtype=float)
+    if bool(use_fix_uncertainty) and ("dt_to_nearest_ib_hours" in cand.columns):
+        dt_fix = pd.to_numeric(cand["dt_to_nearest_ib_hours"], errors="coerce").to_numpy(dtype=float)
+        dt = np.where(np.isfinite(dt_fix), np.maximum(dt_query, dt_fix), dt_query)
     finite = np.isfinite(dist) & np.isfinite(dt) & (dt <= float(dt_max_hours))
     if r_max_km is not None:
         finite = finite & (dist <= float(r_max_km))
@@ -231,11 +250,20 @@ def nearest_ibtracs_fix(
         "basin": str(row["basin"]) if "basin" in cand.columns and pd.notna(row.get("basin")) else None,
         "t_fix": pd.Timestamp(row["time_utc"]),
         "dt_hours": float(dt[idx]),
+        "dt_query_hours": float(dt_query[idx]) if np.isfinite(dt_query[idx]) else None,
+        "dt_fix_hours": float(pd.to_numeric(row.get("dt_to_nearest_ib_hours"), errors="coerce"))
+        if "dt_to_nearest_ib_hours" in cand.columns and pd.notna(row.get("dt_to_nearest_ib_hours"))
+        else None,
         "dist_km": float(dist[idx]),
         "lat": float(row["lat"]),
         "lon": float(normalize_lon_180(float(row["lon"]))),
         "wind": float(row["wind"]) if "wind" in cand.columns and pd.notna(row.get("wind")) else None,
         "pres": float(row["pres"]) if "pres" in cand.columns and pd.notna(row.get("pres")) else None,
+        "speed_kmh": float(row["speed_kmh"]) if "speed_kmh" in cand.columns and pd.notna(row.get("speed_kmh")) else None,
+        "interp_flag": str(row["interp_flag"]) if "interp_flag" in cand.columns and pd.notna(row.get("interp_flag")) else None,
+        "center_uncert_km": float(row["center_uncert_km"])
+        if "center_uncert_km" in cand.columns and pd.notna(row.get("center_uncert_km"))
+        else None,
     }
 
 

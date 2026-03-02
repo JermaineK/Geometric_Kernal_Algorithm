@@ -16,6 +16,11 @@ from scipy.stats import kendalltau, ks_2samp
 
 from gka.core.pipeline import run_pipeline
 from gka.domains import register_builtin_adapters
+from gka.weather.contract import (
+    strict_coverage_ok as contract_strict_coverage_ok,
+    strict_ib_case_flags as contract_strict_ib_case_flags,
+    strict_ib_coverage as contract_strict_ib_coverage,
+)
 from gka.utils.time import utc_now_iso
 
 NullTransform = Callable[[pd.DataFrame, np.random.Generator], pd.DataFrame]
@@ -182,6 +187,37 @@ def parse_args() -> argparse.Namespace:
         help="Maximum allowed far-nonstorm parity signal rate",
     )
     parser.add_argument(
+        "--parity-use-alignment-fraction",
+        dest="parity_use_alignment_fraction",
+        action="store_true",
+        help="Use alignment-fraction metrics (A_align_event/A_align_far) for parity confound gating when available.",
+    )
+    parser.add_argument(
+        "--parity-use-raw-rate",
+        dest="parity_use_alignment_fraction",
+        action="store_false",
+        help="Disable alignment-fraction gating and use raw parity signal rates.",
+    )
+    parser.set_defaults(parity_use_alignment_fraction=True)
+    parser.add_argument(
+        "--alignment-eta-threshold",
+        type=float,
+        default=0.10,
+        help="Per-time eta threshold used to compute alignment fraction metrics.",
+    )
+    parser.add_argument(
+        "--alignment-block-hours",
+        type=float,
+        default=3.0,
+        help="Time block size used for alignment-fraction summaries.",
+    )
+    parser.add_argument(
+        "--claim-min-far-per-lead",
+        type=int,
+        default=3,
+        help="Minimum far_nonstorm test cases per lead to include that lead in claim-mode metrics (0 disables lead filtering)",
+    )
+    parser.add_argument(
         "--anomaly-agreement-mean-min",
         type=float,
         default=0.85,
@@ -296,6 +332,17 @@ def parse_args() -> argparse.Namespace:
         help="Maximum |time delta| hours for strict IBTrACS event slice when time-delta column is available",
     )
     parser.add_argument(
+        "--ibtracs-strict-use-flags",
+        action="store_true",
+        help="Prefer ib_event_strict/ib_far_strict case flags (when present) for IBTrACS strict overlay masks",
+    )
+    parser.add_argument(
+        "--ibtracs-selected-time-basis",
+        choices=["auto", "source", "valid"],
+        default="auto",
+        help="Time basis used for claim-time IBTrACS alignment gate selection (auto picks dominant basis in samples)",
+    )
+    parser.add_argument(
         "--ibtracs-alignment-min-event-cases",
         type=int,
         default=5,
@@ -324,6 +371,201 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Schema version written to claim_contract.json",
+    )
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=0,
+        help="Optional hard cap on number of case_ids used in this evaluation (0 disables cap)",
+    )
+    parser.add_argument(
+        "--case-shards",
+        type=int,
+        default=1,
+        help="Number of deterministic case shards for resumable evaluation",
+    )
+    parser.add_argument(
+        "--case-shard-index",
+        type=int,
+        default=1,
+        help="1-based shard index when --case-shards > 1",
+    )
+    parser.add_argument(
+        "--shard-stratify-by",
+        nargs="+",
+        default=["case_type", "lead_bucket", "time_basis", "storm_id"],
+        help="Case-level fields used to stratify shard assignment; supports comma-separated values",
+    )
+    parser.add_argument(
+        "--claim-far-quality-tags",
+        nargs="+",
+        default=["A_strict_clean"],
+        help="Allowed ib_far_quality_tag values for far controls in claim-mode filtering",
+    )
+    parser.add_argument(
+        "--parity-odd-inner-outer-min",
+        type=float,
+        default=1.10,
+        help="Minimum odd-energy inner/outer ring ratio required for parity pass",
+    )
+    parser.add_argument(
+        "--parity-tangential-radial-min",
+        type=float,
+        default=1.10,
+        help="Minimum tangential/radial odd-energy ratio required for parity pass",
+    )
+    parser.add_argument(
+        "--parity-inner-ring-quantile",
+        type=float,
+        default=0.5,
+        help="Quantile split on L used to define inner vs outer ring for parity localization",
+    )
+    parser.add_argument(
+        "--geometry-required-checks",
+        nargs="+",
+        default=[
+            "theta_roll",
+            "center_swap",
+            "storm_track_reassignment",
+            "time_permutation_within_lead",
+            "theta_scramble_within_ring",
+        ],
+        help="Geometry null checks required by the collapse gate",
+    )
+    parser.add_argument(
+        "--null-transforms",
+        nargs="+",
+        default=[],
+        help=(
+            "Optional subset of null transform names to execute. "
+            "Default runs full built-in null suite."
+        ),
+    )
+    parser.add_argument(
+        "--null-no-signal-max-rate",
+        type=float,
+        default=0.05,
+        help="Maximum null event parity rate allowed when observed event parity is effectively zero",
+    )
+    parser.add_argument(
+        "--strict-coverage-time-basis",
+        choices=["selected", "source", "valid"],
+        default="selected",
+        help="Time basis used for strict IBTrACS event/far coverage checks",
+    )
+    parser.add_argument(
+        "--canonical-time-basis",
+        choices=["auto", "selected", "source", "valid"],
+        default="auto",
+        help=(
+            "Canonical basis for strict cohorts + calibration + IB alignment. "
+            "When set (not auto), enforces one basis across contract-critical paths."
+        ),
+    )
+    parser.add_argument(
+        "--strict-coverage-use-flags",
+        dest="strict_coverage_use_flags",
+        action="store_true",
+        help="Use ib_event_strict/ib_far_strict flags for strict coverage checks when available",
+    )
+    parser.add_argument(
+        "--strict-coverage-no-flags",
+        dest="strict_coverage_use_flags",
+        action="store_false",
+        help="Disable strict-flag usage and rely on distance/time columns for strict coverage checks",
+    )
+    parser.set_defaults(strict_coverage_use_flags=True)
+    parser.add_argument(
+        "--min-strict-event-test-cases",
+        type=int,
+        default=0,
+        help="Minimum strict-IB event test cases required for claim-valid shard status (0 uses --min-event-test-cases)",
+    )
+    parser.add_argument(
+        "--min-strict-far-test-cases",
+        type=int,
+        default=0,
+        help="Minimum strict-IB far test cases required for claim-valid shard status (0 uses --min-far-nonstorm-test-cases)",
+    )
+    parser.add_argument(
+        "--min-ib-event-train",
+        "--min-strict-event-train-cases",
+        dest="min_strict_event_train_cases",
+        type=int,
+        default=0,
+        help="Minimum strict-IB event train cases required for calibration/claim path (0 uses strict test minimum)",
+    )
+    parser.add_argument(
+        "--min-ib-far-train",
+        "--min-strict-far-train-cases",
+        dest="min_strict_far_train_cases",
+        type=int,
+        default=0,
+        help="Minimum strict-IB far train cases required for calibration/claim path (0 uses strict test minimum)",
+    )
+    parser.add_argument(
+        "--min-strict-event-test-per-lead",
+        type=int,
+        default=0,
+        help="Optional per-lead minimum strict-IB event test cases for claim-valid shard status",
+    )
+    parser.add_argument(
+        "--min-strict-far-test-per-lead",
+        type=int,
+        default=0,
+        help="Optional per-lead minimum strict-IB far test cases for claim-valid shard status",
+    )
+    parser.add_argument(
+        "--min-strict-event-train-per-lead",
+        type=int,
+        default=0,
+        help="Optional per-lead minimum strict-IB event train cases for claim-valid shard status",
+    )
+    parser.add_argument(
+        "--min-strict-far-train-per-lead",
+        type=int,
+        default=0,
+        help="Optional per-lead minimum strict-IB far train cases for claim-valid shard status",
+    )
+    parser.add_argument(
+        "--calibrate-parity-thresholds",
+        action="store_true",
+        help="Calibrate storm-local parity thresholds on train split and freeze for test evaluation",
+    )
+    parser.add_argument(
+        "--parity-calibration-event-min-floor",
+        type=float,
+        default=0.05,
+        help="Minimum train event parity rate allowed for calibrated thresholds; lower-rate solutions are rejected.",
+    )
+    parser.add_argument(
+        "--parity-calibration-constrain-min-thresholds",
+        action="store_true",
+        help="Disallow calibrated odd/tangential thresholds below CLI defaults to avoid no-op fits.",
+    )
+    parser.add_argument(
+        "--strict-far-min-row-quality-frac",
+        type=float,
+        default=0.0,
+        help="Minimum per-case fraction of rows carrying allowed far-quality tags for strict far inclusion.",
+    )
+    parser.add_argument(
+        "--strict-far-min-kinematic-clean-frac",
+        type=float,
+        default=0.0,
+        help="Minimum per-case fraction of kinematically clean rows for strict far inclusion.",
+    )
+    parser.add_argument(
+        "--strict-far-min-any-storm-km",
+        type=float,
+        default=0.0,
+        help="Minimum per-case min-distance-to-any-storm (basis-aware) required for strict far inclusion.",
+    )
+    parser.add_argument(
+        "--strict-far-min-nearest-storm-km",
+        type=float,
+        default=0.0,
+        help="Minimum per-case nearest-storm distance (basis-aware) required for strict far inclusion.",
     )
     parser.add_argument(
         "--knee-weather-delta-bic-min",
@@ -358,6 +600,251 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _select_case_subset(
+    samples: pd.DataFrame,
+    *,
+    max_cases: int,
+    case_shards: int,
+    case_shard_index: int,
+    stratify_by: tuple[str, ...] = (),
+    storm_id_col: str | None = None,
+    split_date: pd.Timestamp | None = None,
+    time_buffer_hours: float = 0.0,
+    strict_time_basis: str = "selected",
+    strict_use_flags: bool = True,
+    far_quality_tags: tuple[str, ...] = (),
+    min_event_total: int = 0,
+    min_far_total: int = 0,
+    min_event_train_total: int = 0,
+    min_far_train_total: int = 0,
+    min_train: int = 0,
+    min_test: int = 0,
+    strict_far_min_row_quality_frac: float = 0.0,
+    strict_far_min_kinematic_clean_frac: float = 0.0,
+    strict_far_min_any_storm_km: float = 0.0,
+    strict_far_min_nearest_storm_km: float = 0.0,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if samples.empty or "case_id" not in samples.columns:
+        return samples.copy(), {
+            "enabled": False,
+            "reason": "empty_or_missing_case_id",
+            "n_cases_selected": 0,
+        }
+    all_cases = sorted(samples["case_id"].astype(str).dropna().unique().tolist())
+    if not all_cases:
+        return samples.copy(), {
+            "enabled": False,
+            "reason": "no_cases",
+            "n_cases_selected": 0,
+        }
+    n_shards = int(max(1, case_shards))
+    shard_idx = int(max(1, case_shard_index))
+    shard_idx = int(min(shard_idx, n_shards))
+
+    selected_cases: list[str]
+    if n_shards <= 1:
+        selected_cases = list(all_cases)
+    else:
+        selected_cases = []
+        fields = [str(v).strip() for v in (stratify_by or ()) if str(v).strip()]
+        if not fields:
+            fields = []
+        case_frame = (
+            samples[["case_id"]]
+            .drop_duplicates(subset=["case_id"], keep="first")
+            .copy()
+        )
+        case_frame["case_id"] = case_frame["case_id"].astype(str)
+
+        if "case_type" in fields:
+            src = samples.groupby("case_id", dropna=False)["case_type"].first().astype(str)
+            case_frame["case_type"] = case_frame["case_id"].map(src).fillna("unknown")
+        if "lead" in fields or "lead_bucket" in fields:
+            src = samples.groupby("case_id", dropna=False)["lead_bucket"].first().astype(str)
+            case_frame["lead_bucket"] = case_frame["case_id"].map(src).fillna("none")
+        if "time_basis" in fields:
+            basis_col = None
+            if "ib_time_basis_used" in samples.columns:
+                basis_col = "ib_time_basis_used"
+            elif "time_basis" in samples.columns:
+                basis_col = "time_basis"
+            if basis_col is not None:
+                src = (
+                    samples[["case_id", basis_col]]
+                    .copy()
+                    .dropna(subset=[basis_col])
+                    .groupby("case_id", dropna=False)[basis_col]
+                    .first()
+                    .astype(str)
+                )
+                case_frame["time_basis"] = case_frame["case_id"].map(src).fillna("unknown")
+            else:
+                case_frame["time_basis"] = "unknown"
+        if "storm_id" in fields:
+            sid_col = str(storm_id_col) if storm_id_col else ""
+            if sid_col and sid_col in samples.columns:
+                src = samples.groupby("case_id", dropna=False)[sid_col].first().astype(str)
+                case_frame["storm_id"] = case_frame["case_id"].map(src).fillna("")
+            else:
+                case_frame["storm_id"] = ""
+
+        if fields:
+            key_cols: list[str] = []
+            for f in fields:
+                if f == "lead":
+                    f = "lead_bucket"
+                if f in case_frame.columns:
+                    key_cols.append(str(f))
+            if key_cols:
+                case_frame["_group"] = case_frame[key_cols].astype(str).agg("|".join, axis=1)
+            else:
+                case_frame["_group"] = "all"
+        else:
+            case_frame["_group"] = "all"
+
+        assign: dict[str, int] = {}
+        for _, grp in case_frame.groupby("_group", dropna=False):
+            cids = grp["case_id"].astype(str).tolist()
+            cids = sorted(cids, key=lambda cid: int(hashlib.sha1(cid.encode("utf-8")).hexdigest()[:12], 16))
+            for pos, cid in enumerate(cids):
+                assign[str(cid)] = int((pos % n_shards) + 1)
+        for cid in all_cases:
+            if int(assign.get(str(cid), 1)) == int(shard_idx):
+                selected_cases.append(str(cid))
+    selected_cases = sorted(selected_cases)
+    if int(max_cases) > 0:
+        max_n = int(max_cases)
+        candidate_df = samples.loc[samples["case_id"].astype(str).isin(set(selected_cases))].copy()
+        if (
+            split_date is not None
+            and (not candidate_df.empty)
+            and ("case_id" in candidate_df.columns)
+        ):
+            try:
+                strict_case = _strict_ib_case_flags(
+                    samples=candidate_df,
+                    time_basis=str(strict_time_basis),
+                    use_flags=bool(strict_use_flags),
+                    far_quality_tags=tuple(far_quality_tags),
+                    min_far_quality_fraction=float(strict_far_min_row_quality_frac),
+                    min_far_kinematic_clean_fraction=float(strict_far_min_kinematic_clean_frac),
+                    strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+                    strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+                )
+                strict_case = strict_case.set_index("case_id", drop=False)
+                cand_meta = _build_case_meta(candidate_df, storm_id_col=storm_id_col)
+                split = _blocked_time_split(
+                    case_meta=cand_meta,
+                    split_date=pd.Timestamp(split_date),
+                    buffer_hours=float(time_buffer_hours),
+                )
+                train_ids = sorted([str(v) for v in split.get("train_cases", set())])
+                test_ids = sorted([str(v) for v in split.get("test_cases", set())])
+                remaining = sorted(selected_cases, key=lambda cid: int(hashlib.sha1(cid.encode("utf-8")).hexdigest()[:12], 16))
+
+                test_event = [
+                    cid
+                    for cid in test_ids
+                    if (cid in strict_case.index) and bool(strict_case.loc[cid, "event_flag"])
+                ]
+                test_far = [
+                    cid
+                    for cid in test_ids
+                    if (cid in strict_case.index) and bool(strict_case.loc[cid, "far_flag"])
+                ]
+                train_event = [
+                    cid
+                    for cid in train_ids
+                    if (cid in strict_case.index) and bool(strict_case.loc[cid, "event_flag"])
+                ]
+                train_far = [
+                    cid
+                    for cid in train_ids
+                    if (cid in strict_case.index) and bool(strict_case.loc[cid, "far_flag"])
+                ]
+                selected_priority: list[str] = []
+                selected_set: set[str] = set()
+
+                need_event = int(max(0, min_event_total))
+                need_far = int(max(0, min_far_total))
+                need_event_train = int(max(0, min_event_train_total))
+                need_far_train = int(max(0, min_far_train_total))
+                for cid in test_event[:need_event]:
+                    if cid not in selected_set and len(selected_priority) < max_n:
+                        selected_priority.append(cid)
+                        selected_set.add(cid)
+                for cid in test_far[:need_far]:
+                    if cid not in selected_set and len(selected_priority) < max_n:
+                        selected_priority.append(cid)
+                        selected_set.add(cid)
+                for cid in train_event[:need_event_train]:
+                    if cid not in selected_set and len(selected_priority) < max_n:
+                        selected_priority.append(cid)
+                        selected_set.add(cid)
+                for cid in train_far[:need_far_train]:
+                    if cid not in selected_set and len(selected_priority) < max_n:
+                        selected_priority.append(cid)
+                        selected_set.add(cid)
+
+                min_test_need = int(max(0, min_test))
+                min_train_need = int(max(0, min_train))
+                for cid in test_ids:
+                    if len(selected_priority) >= max_n:
+                        break
+                    if cid in selected_set:
+                        continue
+                    current_test = sum(1 for v in selected_priority if v in set(test_ids))
+                    if current_test < min_test_need:
+                        selected_priority.append(cid)
+                        selected_set.add(cid)
+                for cid in train_ids:
+                    if len(selected_priority) >= max_n:
+                        break
+                    if cid in selected_set:
+                        continue
+                    current_train = sum(1 for v in selected_priority if v in set(train_ids))
+                    if current_train < min_train_need:
+                        selected_priority.append(cid)
+                        selected_set.add(cid)
+
+                for cid in remaining:
+                    if len(selected_priority) >= max_n:
+                        break
+                    if cid in selected_set:
+                        continue
+                    selected_priority.append(cid)
+                    selected_set.add(cid)
+
+                selected_cases = sorted(selected_priority)
+            except Exception:
+                selected_cases = selected_cases[:max_n]
+        else:
+            selected_cases = selected_cases[:max_n]
+
+    out = samples.loc[samples["case_id"].astype(str).isin(set(selected_cases))].copy()
+    info = {
+        "enabled": bool((n_shards > 1) or (int(max_cases) > 0)),
+        "case_shards": int(n_shards),
+        "case_shard_index": int(shard_idx),
+        "shard_stratify_by": [str(v) for v in (stratify_by or ())],
+        "max_cases": int(max_cases),
+        "n_cases_total": int(len(all_cases)),
+        "n_cases_selected": int(len(selected_cases)),
+        "n_rows_selected": int(out.shape[0]),
+        "subset_contract_preserving": bool(int(max_cases) > 0 and split_date is not None),
+        "strict_time_basis": str(strict_time_basis),
+        "strict_use_flags": bool(strict_use_flags),
+        "claim_far_quality_tags": [str(v) for v in (far_quality_tags or ())],
+        "min_event_total": int(min_event_total),
+        "min_far_total": int(min_far_total),
+        "min_event_train_total": int(min_event_train_total),
+        "min_far_train_total": int(min_far_train_total),
+        "min_train": int(min_train),
+        "min_test": int(min_test),
+    }
+    return out, info
+
+
 def main() -> int:
     args = parse_args()
     register_builtin_adapters()
@@ -369,10 +856,100 @@ def main() -> int:
     if not config_path.exists():
         raise FileNotFoundError(f"Config path not found: {config_path}")
 
-    samples = pd.read_parquet(dataset_dir / "samples.parquet")
-    samples["t"] = pd.to_datetime(samples["t"], errors="coerce")
-    if "onset_time" in samples.columns:
-        samples["onset_time"] = pd.to_datetime(samples["onset_time"], errors="coerce")
+    samples_all = pd.read_parquet(dataset_dir / "samples.parquet")
+    samples_all["t"] = pd.to_datetime(samples_all["t"], errors="coerce")
+    if "onset_time" in samples_all.columns:
+        samples_all["onset_time"] = pd.to_datetime(samples_all["onset_time"], errors="coerce")
+    shard_stratify_tokens: list[str] = []
+    for tok in (args.shard_stratify_by or []):
+        for part in str(tok).split(","):
+            part = str(part).strip()
+            if part:
+                shard_stratify_tokens.append(part)
+    claim_far_quality_tags = [
+        str(v).strip()
+        for tok in (args.claim_far_quality_tags or [])
+        for v in str(tok).split(",")
+        if str(v).strip()
+    ]
+    geometry_required_checks = [
+        str(v).strip()
+        for tok in (args.geometry_required_checks or [])
+        for v in str(tok).split(",")
+        if str(v).strip()
+    ]
+    strict_time_basis = str(args.strict_coverage_time_basis).strip().lower()
+    if strict_time_basis not in {"selected", "source", "valid"}:
+        strict_time_basis = "selected"
+    canonical_time_basis = str(args.canonical_time_basis).strip().lower()
+    if canonical_time_basis not in {"auto", "selected", "source", "valid"}:
+        canonical_time_basis = "auto"
+    if canonical_time_basis != "auto":
+        strict_time_basis = str(canonical_time_basis)
+    strict_use_flags = bool(args.strict_coverage_use_flags)
+    strict_min_event_test_total = int(args.min_strict_event_test_cases) if int(args.min_strict_event_test_cases) > 0 else int(args.min_event_test_cases)
+    strict_min_far_test_total = int(args.min_strict_far_test_cases) if int(args.min_strict_far_test_cases) > 0 else int(args.min_far_nonstorm_test_cases)
+    strict_min_event_test_per_lead = int(args.min_strict_event_test_per_lead) if int(args.min_strict_event_test_per_lead) > 0 else int(args.min_event_test_per_lead)
+    strict_min_far_test_per_lead = int(args.min_strict_far_test_per_lead) if int(args.min_strict_far_test_per_lead) > 0 else int(args.min_far_nonstorm_test_per_lead)
+    strict_min_event_train_total = int(args.min_strict_event_train_cases) if int(args.min_strict_event_train_cases) > 0 else int(strict_min_event_test_total)
+    strict_min_far_train_total = int(args.min_strict_far_train_cases) if int(args.min_strict_far_train_cases) > 0 else int(strict_min_far_test_total)
+    strict_min_event_train_per_lead = int(args.min_strict_event_train_per_lead) if int(args.min_strict_event_train_per_lead) > 0 else int(strict_min_event_test_per_lead)
+    strict_min_far_train_per_lead = int(args.min_strict_far_train_per_lead) if int(args.min_strict_far_train_per_lead) > 0 else int(strict_min_far_test_per_lead)
+
+    initial_storm_id_col = _resolve_storm_id_col(samples_all, requested=args.storm_id_col)
+    shard_manifest = _build_evaluation_shard_manifest(
+        samples=samples_all,
+        split_date=pd.Timestamp(args.split_date),
+        time_buffer_hours=float(args.time_buffer_hours),
+        case_shards=int(args.case_shards),
+        max_cases=int(args.max_cases),
+        stratify_by=tuple(shard_stratify_tokens),
+        storm_id_col=initial_storm_id_col,
+        strict_time_basis=strict_time_basis,
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_event_test_total=int(strict_min_event_test_total),
+        min_far_test_total=int(strict_min_far_test_total),
+        min_event_test_per_lead=int(strict_min_event_test_per_lead),
+        min_far_test_per_lead=int(strict_min_far_test_per_lead),
+        min_event_train_total=int(strict_min_event_train_total),
+        min_far_train_total=int(strict_min_far_train_total),
+        min_event_train_per_lead=int(strict_min_event_train_per_lead),
+        min_far_train_per_lead=int(strict_min_far_train_per_lead),
+        min_train_cases=int(args.min_train_cases),
+        min_test_cases=int(args.min_test_cases),
+        current_shard_index=int(args.case_shard_index),
+        strict_far_min_row_quality_frac=float(args.strict_far_min_row_quality_frac),
+        strict_far_min_kinematic_clean_frac=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+
+    samples, case_subset_info = _select_case_subset(
+        samples_all,
+        max_cases=int(args.max_cases),
+        case_shards=int(args.case_shards),
+        case_shard_index=int(args.case_shard_index),
+        stratify_by=tuple(shard_stratify_tokens),
+        storm_id_col=initial_storm_id_col,
+        split_date=pd.Timestamp(args.split_date),
+        time_buffer_hours=float(args.time_buffer_hours),
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_event_total=int(strict_min_event_test_total),
+        min_far_total=int(strict_min_far_test_total),
+        min_event_train_total=int(strict_min_event_train_total),
+        min_far_train_total=int(strict_min_far_train_total),
+        min_train=int(args.min_train_cases),
+        min_test=int(args.min_test_cases),
+        strict_far_min_row_quality_frac=float(args.strict_far_min_row_quality_frac),
+        strict_far_min_kinematic_clean_frac=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    if samples.empty:
+        raise ValueError("no_rows_after_case_subset")
     split_date = pd.Timestamp(args.split_date)
     rng = np.random.default_rng(int(args.seed))
 
@@ -403,6 +980,46 @@ def main() -> int:
         min_total=int(args.min_far_nonstorm_test_cases),
         min_per_lead=int(args.min_far_nonstorm_test_per_lead),
     )
+    strict_cov_test = _strict_ib_coverage(
+        samples=samples,
+        case_ids=test_cases,
+        time_basis=str(strict_time_basis),
+        use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    strict_cov_train = _strict_ib_coverage(
+        samples=samples,
+        case_ids=train_cases,
+        time_basis=str(strict_time_basis),
+        use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    strict_test_ok, strict_test_reasons = _strict_coverage_ok(
+        coverage=strict_cov_test,
+        min_event_total=int(strict_min_event_test_total),
+        min_far_total=int(strict_min_far_test_total),
+        min_event_per_lead=int(strict_min_event_test_per_lead),
+        min_far_per_lead=int(strict_min_far_test_per_lead),
+    )
+    strict_train_ok, strict_train_reasons = _strict_coverage_ok(
+        coverage=strict_cov_train,
+        min_event_total=int(strict_min_event_train_total),
+        min_far_total=int(strict_min_far_train_total),
+        min_event_per_lead=int(strict_min_event_train_per_lead),
+        min_far_per_lead=int(strict_min_far_train_per_lead),
+    )
+    strict_cov_ok = bool(strict_test_ok and strict_train_ok)
+    strict_cov_reasons = [f"test:{v}" for v in strict_test_reasons] + [f"train:{v}" for v in strict_train_reasons]
+    if not bool(strict_cov_ok):
+        raise ValueError("insufficient_strict_ib_coverage:" + ";".join([str(v) for v in strict_cov_reasons]))
     train_df = samples.loc[samples["case_id"].astype(str).isin(train_cases)].copy()
     test_df = samples.loc[samples["case_id"].astype(str).isin(test_cases)].copy()
     axis_meta = _load_axis_robust_meta(
@@ -418,6 +1035,9 @@ def main() -> int:
         seed=int(args.seed),
         enable_time_frequency_knee=bool(args.enable_time_frequency_knee),
         tf_knee_bic_delta_min=float(args.tf_knee_bic_delta_min),
+        parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
+        parity_tangential_radial_min=float(args.parity_tangential_radial_min),
+        parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
     )
     test_case_metrics = _evaluate_cases(
         test_df,
@@ -426,6 +1046,9 @@ def main() -> int:
         seed=int(args.seed) + 1,
         enable_time_frequency_knee=bool(args.enable_time_frequency_knee),
         tf_knee_bic_delta_min=float(args.tf_knee_bic_delta_min),
+        parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
+        parity_tangential_radial_min=float(args.parity_tangential_radial_min),
+        parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
     )
     train_case_metrics = _apply_axis_robust_gating(train_case_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
     test_case_metrics = _apply_axis_robust_gating(test_case_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
@@ -444,10 +1067,40 @@ def main() -> int:
         "axis_robust": axis_meta,
         "n_rows_total": int(samples.shape[0]),
         "n_cases_total": int(samples["case_id"].nunique()),
+        "n_rows_dataset_full": int(samples_all.shape[0]),
+        "n_cases_dataset_full": int(samples_all["case_id"].nunique()) if "case_id" in samples_all.columns else 0,
+        "case_subset": case_subset_info,
+        "evaluation_shard_manifest": shard_manifest,
         "n_cases_train": int(len(train_cases)),
         "n_cases_test": int(len(test_cases)),
         "n_cases_buffer_excluded": int(len(buffer_cases)),
         "test_coverage": test_cov,
+        "strict_test_coverage": strict_cov_test,
+        "strict_train_coverage": strict_cov_train,
+        "strict_coverage_gate": {
+            "passed": bool(strict_cov_ok),
+            "reasons": [str(v) for v in strict_cov_reasons],
+            "time_basis": str(strict_time_basis),
+            "use_flags": bool(strict_use_flags),
+            "thresholds": {
+                "min_event_total": int(strict_min_event_test_total),
+                "min_far_total": int(strict_min_far_test_total),
+                "min_event_per_lead": int(strict_min_event_test_per_lead),
+                "min_far_per_lead": int(strict_min_far_test_per_lead),
+                "test": {
+                    "min_event_total": int(strict_min_event_test_total),
+                    "min_far_total": int(strict_min_far_test_total),
+                    "min_event_per_lead": int(strict_min_event_test_per_lead),
+                    "min_far_per_lead": int(strict_min_far_test_per_lead),
+                },
+                "train": {
+                    "min_event_total": int(strict_min_event_train_total),
+                    "min_far_total": int(strict_min_far_train_total),
+                    "min_event_per_lead": int(strict_min_event_train_per_lead),
+                    "min_far_per_lead": int(strict_min_far_train_per_lead),
+                },
+            },
+        },
         "far_nonstorm_coverage_test": test_cov.get("far_nonstorm", {}),
         "event_coverage_test": test_cov.get("events", {}),
         "min_train_cases": int(args.min_train_cases),
@@ -456,6 +1109,21 @@ def main() -> int:
         "min_event_test_per_lead": int(args.min_event_test_per_lead),
         "min_far_nonstorm_test_cases": int(args.min_far_nonstorm_test_cases),
         "min_far_nonstorm_test_per_lead": int(args.min_far_nonstorm_test_per_lead),
+        "min_strict_event_test_cases": int(strict_min_event_test_total),
+        "min_strict_far_test_cases": int(strict_min_far_test_total),
+        "min_strict_event_test_per_lead": int(strict_min_event_test_per_lead),
+        "min_strict_far_test_per_lead": int(strict_min_far_test_per_lead),
+        "min_strict_event_train_cases": int(strict_min_event_train_total),
+        "min_strict_far_train_cases": int(strict_min_far_train_total),
+        "min_strict_event_train_per_lead": int(strict_min_event_train_per_lead),
+        "min_strict_far_train_per_lead": int(strict_min_far_train_per_lead),
+        "claim_far_quality_tags": [str(v) for v in claim_far_quality_tags],
+        "geometry_required_checks": [str(v) for v in geometry_required_checks],
+        "canonical_time_basis": str(canonical_time_basis),
+        "canonical_time_basis_enforced": bool(canonical_time_basis != "auto"),
+        "parity_odd_inner_outer_min": float(args.parity_odd_inner_outer_min),
+        "parity_tangential_radial_min": float(args.parity_tangential_radial_min),
+        "parity_inner_ring_quantile": float(args.parity_inner_ring_quantile),
         "split_audit": _build_split_audit(
             case_meta=case_meta,
             train_cases=train_cases,
@@ -496,15 +1164,29 @@ def main() -> int:
         "direction_randomization": _direction_randomization,
         "spatial_shuffle": _spatial_shuffle_control,
         "time_permutation_within_lead": _time_permutation_within_lead,
+        "time_permutation_within_track_phase": _time_permutation_within_lead,
+        "lat_band_shuffle_within_month_hour": _lat_band_shuffle_within_month_hour,
         "fake_mirror_pairing": _fake_mirror_pairing,
         "latitude_mirror_pairing": _latitude_mirror_pairing,
         "circular_lon_shift_pairing": _circular_lon_shift_pairing,
         "theta_roll": _theta_roll_polar,
+        "theta_scramble_within_ring": _theta_scramble_within_ring,
         "radial_shuffle": _radial_shuffle_polar,
         "radial_scramble": _radial_scramble_polar,
         "mirror_axis_jitter": _mirror_axis_jitter,
         "center_jitter": _center_jitter_polar,
+        "center_swap": _center_swap_polar,
+        "storm_track_reassignment": _storm_track_reassignment,
+        "storm_track_reassignment_phase_matched": _storm_track_reassignment,
     }
+    requested_nulls = {
+        str(v).strip()
+        for tok in (args.null_transforms or [])
+        for v in str(tok).split(",")
+        if str(v).strip()
+    }
+    if requested_nulls:
+        null_transforms = {k: v for k, v in null_transforms.items() if k in requested_nulls}
     null_controls: dict[str, dict[str, Any]] = {}
     null_case_metrics: dict[str, pd.DataFrame] = {}
     null_strata: dict[str, dict[str, Any]] = {}
@@ -523,21 +1205,30 @@ def main() -> int:
             seed=int(args.seed) + 301 + i,
             enable_time_frequency_knee=bool(args.enable_time_frequency_knee),
             tf_knee_bic_delta_min=float(args.tf_knee_bic_delta_min),
+            parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
+            parity_tangential_radial_min=float(args.parity_tangential_radial_min),
+            parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
         )
         metrics = _apply_axis_robust_gating(metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
         null_case_metrics[name] = metrics
         null_strata[name] = _summarize_case_metrics_by_strata(metrics, p_lock_threshold=float(args.p_lock_threshold))
     summary["null_controls"] = null_controls
     summary["null_strata"] = null_strata
+    geom_audit_keys = (
+        "theta_roll",
+        "theta_scramble_within_ring",
+        "center_swap",
+        "storm_track_reassignment",
+        "time_permutation_within_lead",
+        "lat_band_shuffle_within_month_hour",
+        "radial_shuffle",
+        "radial_scramble",
+        "mirror_axis_jitter",
+        "center_jitter",
+    )
     geometry_null_audit = _build_geometry_null_audit(
         samples=test_df,
-        transforms={
-            "theta_roll": null_transforms["theta_roll"],
-            "radial_shuffle": null_transforms["radial_shuffle"],
-            "radial_scramble": null_transforms["radial_scramble"],
-            "mirror_axis_jitter": null_transforms["mirror_axis_jitter"],
-            "center_jitter": null_transforms["center_jitter"],
-        },
+        transforms={k: null_transforms[k] for k in geom_audit_keys if k in null_transforms},
         seed=int(args.seed) + 13000,
     )
     summary["geometry_null_audit"] = geometry_null_audit
@@ -557,6 +1248,9 @@ def main() -> int:
         seed=int(args.seed) + 5000,
         p_lock_threshold=float(args.p_lock_threshold),
         axis_robust=bool(axis_meta.get("axis_robust", False)),
+        parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
+        parity_tangential_radial_min=float(args.parity_tangential_radial_min),
+        parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
     )
     summary["parity_ablation"] = parity_ablation
     anomaly_ablation, anomaly_mode_case_metrics = _build_anomaly_mode_ablation(
@@ -568,6 +1262,9 @@ def main() -> int:
         axis_robust=bool(axis_meta.get("axis_robust", False)),
         enable_time_frequency_knee=bool(args.enable_time_frequency_knee),
         tf_knee_bic_delta_min=float(args.tf_knee_bic_delta_min),
+        parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
+        parity_tangential_radial_min=float(args.parity_tangential_radial_min),
+        parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
     )
     summary["anomaly_mode_ablation"] = anomaly_ablation
 
@@ -633,6 +1330,31 @@ def main() -> int:
         "strata": _summarize_case_metrics_by_strata(ensemble_case_metrics, p_lock_threshold=float(args.p_lock_threshold)),
     }
 
+    claim_retention_train_stages: dict[str, dict[str, Any]] = {
+        "pre_claim_input": _strict_case_counts_from_samples(
+            samples=train_df,
+            strict_time_basis=str(strict_time_basis),
+            strict_use_flags=bool(strict_use_flags),
+            far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+            min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+            min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+            strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+            strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+        )
+    }
+    claim_retention_test_stages: dict[str, dict[str, Any]] = {
+        "pre_claim_input": _strict_case_counts_from_samples(
+            samples=test_df,
+            strict_time_basis=str(strict_time_basis),
+            strict_use_flags=bool(strict_use_flags),
+            far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+            min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+            min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+            strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+            strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+        )
+    }
+
     requested_claim_mode = str(args.parity_claim_mode or "auto")
     if requested_claim_mode == "auto":
         base_claim_mode = _select_claim_mode(
@@ -668,7 +1390,161 @@ def main() -> int:
         claim_train_df = _with_observable_mode(train_df, mode=claim_mode)
         claim_test_df = _with_observable_mode(test_df, mode=claim_mode)
 
+    claim_retention_train_stages["after_mode_application"] = _strict_case_counts_from_samples(
+        samples=claim_train_df,
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    claim_retention_test_stages["after_mode_application"] = _strict_case_counts_from_samples(
+        samples=claim_test_df,
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+
+    claim_train_df, claim_test_df, claim_lead_filter = _filter_claim_leads_by_far_coverage(
+        train_df=claim_train_df,
+        test_df=claim_test_df,
+        min_far_per_lead=int(args.claim_min_far_per_lead),
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    claim_retention_train_stages["after_lead_filter"] = _strict_case_counts_from_samples(
+        samples=claim_train_df,
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    claim_retention_test_stages["after_lead_filter"] = _strict_case_counts_from_samples(
+        samples=claim_test_df,
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    claim_train_df, claim_test_df, strict_far_claim_filter = _filter_claim_to_strict_far_controls(
+        train_df=claim_train_df,
+        test_df=claim_test_df,
+        allowed_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+    )
+    claim_retention_train_stages["after_strict_far_filter"] = _strict_case_counts_from_samples(
+        samples=claim_train_df,
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    claim_retention_test_stages["after_strict_far_filter"] = _strict_case_counts_from_samples(
+        samples=claim_test_df,
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    parity_thresholds_applied = {
+        "odd_inner_outer_min": float(args.parity_odd_inner_outer_min),
+        "tangential_radial_min": float(args.parity_tangential_radial_min),
+        "inner_ring_quantile": float(args.parity_inner_ring_quantile),
+    }
+    parity_threshold_calibration: dict[str, Any] = {
+        "enabled": bool(args.calibrate_parity_thresholds),
+        "available": False,
+        "reason": "disabled",
+        "thresholds": dict(parity_thresholds_applied),
+    }
+    strict_claim_cohorts: dict[str, Any] = {
+        "calibration_train": {},
+        "claim_train": {},
+        "claim_test": {},
+    }
+    parity_feature_distributions = _parity_feature_distribution_table(pd.DataFrame())
+    if bool(args.calibrate_parity_thresholds):
+        calib_train_metrics = _evaluate_cases(
+            claim_train_df,
+            dataset_dir=dataset_dir,
+            config_path=config_path,
+            seed=int(args.seed) + 8900,
+            enable_time_frequency_knee=bool(args.enable_time_frequency_knee),
+            tf_knee_bic_delta_min=float(args.tf_knee_bic_delta_min),
+            parity_odd_inner_outer_min=0.0,
+            parity_tangential_radial_min=0.0,
+            parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
+        )
+        calib_train_metrics = _apply_axis_robust_gating(
+            calib_train_metrics, axis_robust=bool(axis_meta.get("axis_robust", False))
+        )
+        calib_train_metrics, strict_claim_cohorts["calibration_train"] = _apply_strict_claim_strata(
+            case_metrics=calib_train_metrics,
+            samples=claim_train_df,
+            strict_time_basis=str(strict_time_basis),
+            strict_use_flags=bool(strict_use_flags),
+            far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+            min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+            min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+            strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+            strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+        )
+        parity_feature_distributions = _parity_feature_distribution_table(calib_train_metrics)
+        calib = _calibrate_parity_thresholds_from_train(
+            train_case_metrics=calib_train_metrics,
+            default_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
+            default_tangential_radial_min=float(args.parity_tangential_radial_min),
+            event_min_floor=float(args.parity_calibration_event_min_floor),
+            constrain_min_thresholds=bool(args.parity_calibration_constrain_min_thresholds),
+        )
+        parity_threshold_calibration = {
+            **calib,
+            "enabled": True,
+            "inner_ring_quantile": float(args.parity_inner_ring_quantile),
+            "strict_train_cohorts": strict_claim_cohorts.get("calibration_train", {}),
+        }
+        if bool(calib.get("available", False)):
+            thr = calib.get("thresholds", {}) or {}
+            parity_thresholds_applied["odd_inner_outer_min"] = float(
+                _to_float(thr.get("odd_inner_outer_min")) or parity_thresholds_applied["odd_inner_outer_min"]
+            )
+            parity_thresholds_applied["tangential_radial_min"] = float(
+                _to_float(thr.get("tangential_radial_min")) or parity_thresholds_applied["tangential_radial_min"]
+            )
+
+    claim_retention_train_stages["after_case_reduction_calibration"] = {
+        **(strict_claim_cohorts.get("calibration_train", {}) or {}),
+        "n_rows": int(claim_train_df.shape[0]),
+    }
+
     summary["claim_mode_applied"] = claim_mode
+    summary["claim_lead_filter"] = claim_lead_filter
+    summary["claim_strict_far_filter"] = strict_far_claim_filter
+    summary["claim_strict_cohorts"] = strict_claim_cohorts
+    summary["parity_threshold_calibration"] = parity_threshold_calibration
+    summary["parity_thresholds_applied"] = parity_thresholds_applied
     claim_train_metrics = _evaluate_cases(
         claim_train_df,
         dataset_dir=dataset_dir,
@@ -676,6 +1552,11 @@ def main() -> int:
         seed=int(args.seed) + 9000,
         enable_time_frequency_knee=bool(args.enable_time_frequency_knee),
         tf_knee_bic_delta_min=float(args.tf_knee_bic_delta_min),
+        parity_odd_inner_outer_min=float(parity_thresholds_applied["odd_inner_outer_min"]),
+        parity_tangential_radial_min=float(parity_thresholds_applied["tangential_radial_min"]),
+        parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
+        alignment_eta_threshold=float(args.alignment_eta_threshold),
+        alignment_block_hours=float(args.alignment_block_hours),
     )
     claim_test_metrics = _evaluate_cases(
         claim_test_df,
@@ -684,9 +1565,67 @@ def main() -> int:
         seed=int(args.seed) + 9001,
         enable_time_frequency_knee=bool(args.enable_time_frequency_knee),
         tf_knee_bic_delta_min=float(args.tf_knee_bic_delta_min),
+        parity_odd_inner_outer_min=float(parity_thresholds_applied["odd_inner_outer_min"]),
+        parity_tangential_radial_min=float(parity_thresholds_applied["tangential_radial_min"]),
+        parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
+        alignment_eta_threshold=float(args.alignment_eta_threshold),
+        alignment_block_hours=float(args.alignment_block_hours),
     )
     claim_train_metrics = _apply_axis_robust_gating(claim_train_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
     claim_test_metrics = _apply_axis_robust_gating(claim_test_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
+    claim_train_metrics, strict_claim_cohorts["claim_train"] = _apply_strict_claim_strata(
+        case_metrics=claim_train_metrics,
+        samples=claim_train_df,
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    claim_test_metrics, strict_claim_cohorts["claim_test"] = _apply_strict_claim_strata(
+        case_metrics=claim_test_metrics,
+        samples=claim_test_df,
+        strict_time_basis=str(strict_time_basis),
+        strict_use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(str(v) for v in claim_far_quality_tags),
+        min_far_quality_fraction=float(args.strict_far_min_row_quality_frac),
+        min_far_kinematic_clean_fraction=float(args.strict_far_min_kinematic_clean_frac),
+        strict_far_min_any_storm_km=float(args.strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
+    )
+    claim_retention_train_stages["after_case_reduction_claim"] = {
+        **(strict_claim_cohorts.get("claim_train", {}) or {}),
+        "n_rows": int(claim_train_df.shape[0]),
+    }
+    claim_retention_test_stages["after_case_reduction_claim"] = {
+        **(strict_claim_cohorts.get("claim_test", {}) or {}),
+        "n_rows": int(claim_test_df.shape[0]),
+    }
+    claim_retention_audit = _build_claim_retention_audit(
+        train_stages=claim_retention_train_stages,
+        test_stages=claim_retention_test_stages,
+    )
+    strict_train_events = int((strict_cov_train or {}).get("event_total", 0) or 0)
+    strict_train_far = int((strict_cov_train or {}).get("far_total", 0) or 0)
+    calib_ev = int((strict_claim_cohorts.get("calibration_train", {}) or {}).get("n_cases_event", 0) or 0)
+    calib_far = int((strict_claim_cohorts.get("calibration_train", {}) or {}).get("n_cases_far", 0) or 0)
+    claim_path_starvation = bool(strict_train_events > 0 and strict_train_far > 0 and (calib_ev <= 0 or calib_far <= 0))
+    claim_retention_audit["starvation"] = {
+        "claim_path_event_starvation": bool(claim_path_starvation),
+        "strict_train_event_total": int(strict_train_events),
+        "strict_train_far_total": int(strict_train_far),
+        "calibration_train_event_cases": int(calib_ev),
+        "calibration_train_far_cases": int(calib_far),
+    }
+    if claim_path_starvation:
+        summary["parity_threshold_calibration"]["reason"] = "claim_path_event_starvation"
+        summary["parity_threshold_calibration"]["available"] = bool(
+            summary["parity_threshold_calibration"].get("available", False)
+        )
+    summary["claim_retention_audit"] = claim_retention_audit
+    summary["claim_strict_cohorts"] = strict_claim_cohorts
 
     claim_strata = {
         "train": _summarize_case_metrics_by_strata(claim_train_metrics, p_lock_threshold=float(args.p_lock_threshold)),
@@ -719,13 +1658,37 @@ def main() -> int:
         confound_max_ratio=float(args.parity_confound_max_ratio),
         event_minus_far_min=float(args.parity_event_minus_far_min),
         far_nonstorm_max=float(args.parity_far_max),
+        use_alignment_fraction=bool(args.parity_use_alignment_fraction),
     )
     summary["parity_confound_gate"] = parity_confound_gate
     geometry_null_strata: dict[str, dict[str, Any]] = {}
-    geometry_null_names = ("theta_roll", "center_jitter", "mirror_axis_jitter", "radial_scramble")
+    requested_required_checks = [str(v).strip() for v in geometry_required_checks if str(v).strip()]
+    optional_checks = [
+        "lat_band_shuffle_within_month_hour",
+        "center_jitter",
+        "mirror_axis_jitter",
+        "radial_scramble",
+        "radial_shuffle",
+        "theta_scramble_within_ring",
+    ]
+    geometry_null_names = tuple(dict.fromkeys(requested_required_checks + optional_checks))
+    geometry_null_names = tuple(name for name in geometry_null_names if name in null_transforms)
+    center_swap_distance_stats: dict[str, Any] = {}
     for j, name in enumerate(geometry_null_names):
         transform = null_transforms[name]
         transformed_claim = transform(claim_test_df, rng=np.random.default_rng(int(args.seed) + 9600 + j))
+        if str(name) == "center_swap":
+            dist_vals = pd.to_numeric(transformed_claim.get("center_swap_center_distance_km"), errors="coerce")
+            dist_vals = dist_vals[np.isfinite(dist_vals)]
+            if dist_vals.size > 0:
+                center_swap_distance_stats = {
+                    "n": int(dist_vals.size),
+                    "p10_km": float(np.nanpercentile(dist_vals, 10)),
+                    "p50_km": float(np.nanpercentile(dist_vals, 50)),
+                    "p90_km": float(np.nanpercentile(dist_vals, 90)),
+                }
+            else:
+                center_swap_distance_stats = {"n": 0}
         geom_metrics = _evaluate_cases(
             transformed_claim,
             dataset_dir=dataset_dir,
@@ -733,6 +1696,11 @@ def main() -> int:
             seed=int(args.seed) + 9700 + j,
             enable_time_frequency_knee=bool(args.enable_time_frequency_knee),
             tf_knee_bic_delta_min=float(args.tf_knee_bic_delta_min),
+            parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
+            parity_tangential_radial_min=float(args.parity_tangential_radial_min),
+            parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
+            alignment_eta_threshold=float(args.alignment_eta_threshold),
+            alignment_block_hours=float(args.alignment_block_hours),
         )
         geom_metrics = _apply_axis_robust_gating(geom_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
         geometry_null_strata[name] = _summarize_case_metrics_by_strata(geom_metrics, p_lock_threshold=float(args.p_lock_threshold))
@@ -742,7 +1710,16 @@ def main() -> int:
         null_strata=geometry_null_strata,
         min_rel_drop=float(args.null_collapse_min_drop),
         min_abs_drop=float(args.null_collapse_min_abs_drop),
-        required_checks=("theta_roll", "center_jitter"),
+        rate_key=(
+            "alignment_event_weighted_rate"
+            if str(parity_confound_gate.get("rate_basis", "")).startswith("alignment")
+            else "parity_signal_rate"
+        ),
+        no_signal_max_rate=float(args.null_no_signal_max_rate),
+        required_checks=tuple(requested_required_checks)
+        if requested_required_checks
+        else ("theta_roll", "center_swap", "storm_track_reassignment", "time_permutation_within_lead"),
+        center_swap_distance_stats=center_swap_distance_stats,
     )
     summary["geometry_null_collapse"] = geometry_null_collapse
     summary["geometry_null_by_mode"] = _build_geometry_null_by_mode(
@@ -752,8 +1729,15 @@ def main() -> int:
     vortex_centered = _is_vortex_centered_context(samples=test_df)
     angular_witness = _build_angular_witness_report(
         observed_samples=claim_test_df,
-        theta_roll_samples=null_transforms["theta_roll"](claim_test_df, rng=np.random.default_rng(int(args.seed) + 9801)),
-        center_jitter_samples=null_transforms["center_jitter"](claim_test_df, rng=np.random.default_rng(int(args.seed) + 9802)),
+        theta_roll_samples=(null_transforms.get("theta_roll", _theta_roll_polar))(
+            claim_test_df, rng=np.random.default_rng(int(args.seed) + 9801)
+        ),
+        center_swap_samples=(null_transforms.get("center_swap", _center_swap_polar))(
+            claim_test_df, rng=np.random.default_rng(int(args.seed) + 9802)
+        ),
+        center_jitter_samples=(null_transforms.get("center_jitter", _center_jitter_polar))(
+            claim_test_df, rng=np.random.default_rng(int(args.seed) + 9803)
+        ),
         margin_min=float(args.angular_witness_margin_min),
         d_min=float(args.angular_witness_d_min),
         p_max=float(args.angular_witness_p_max),
@@ -764,6 +1748,26 @@ def main() -> int:
         required=bool(vortex_centered),
     )
     summary["angular_witness"] = angular_witness
+    ibtracs_strict_eval_source = _build_ibtracs_strict_eval(
+        case_metrics=claim_test_metrics,
+        samples=claim_test_df,
+        radius_km=float(args.ibtracs_strict_radius_km),
+        far_min_km=float(args.ibtracs_strict_far_min_km),
+        time_hours=float(args.ibtracs_strict_time_hours),
+        p_lock_threshold=float(args.p_lock_threshold),
+        use_flags=bool(args.ibtracs_strict_use_flags),
+        time_basis="source",
+    )
+    ibtracs_strict_eval_valid = _build_ibtracs_strict_eval(
+        case_metrics=claim_test_metrics,
+        samples=claim_test_df,
+        radius_km=float(args.ibtracs_strict_radius_km),
+        far_min_km=float(args.ibtracs_strict_far_min_km),
+        time_hours=float(args.ibtracs_strict_time_hours),
+        p_lock_threshold=float(args.p_lock_threshold),
+        use_flags=bool(args.ibtracs_strict_use_flags),
+        time_basis="valid",
+    )
     ibtracs_strict_eval = _build_ibtracs_strict_eval(
         case_metrics=claim_test_metrics,
         samples=claim_test_df,
@@ -771,15 +1775,116 @@ def main() -> int:
         far_min_km=float(args.ibtracs_strict_far_min_km),
         time_hours=float(args.ibtracs_strict_time_hours),
         p_lock_threshold=float(args.p_lock_threshold),
+        use_flags=bool(args.ibtracs_strict_use_flags),
+        time_basis="selected",
     )
-    summary["ibtracs_strict_eval"] = ibtracs_strict_eval
-    ibtracs_alignment_gate = _build_ibtracs_alignment_gate(
-        strict_eval=ibtracs_strict_eval,
+    selected_basis = str(args.ibtracs_selected_time_basis).strip().lower()
+    if canonical_time_basis != "auto":
+        if selected_basis not in {"auto", str(canonical_time_basis)}:
+            raise ValueError(
+                "time_basis_contract_violation:"
+                f"canonical={canonical_time_basis};ibtracs_selected={selected_basis}"
+            )
+        selected_basis = str(canonical_time_basis)
+    elif selected_basis == "auto":
+        basis_counts = (
+            claim_test_df.get("ib_time_basis_used", pd.Series(dtype=object))
+            .fillna(claim_test_df.get("time_basis", pd.Series(dtype=object)))
+            .fillna("source")
+            .astype(str)
+            .str.lower()
+            .value_counts(dropna=False)
+            .to_dict()
+        )
+        if basis_counts:
+            selected_basis = str(max(basis_counts.items(), key=lambda kv: kv[1])[0])
+        else:
+            selected_basis = str(strict_time_basis)
+    if selected_basis not in {"source", "valid", "selected"}:
+        selected_basis = "selected"
+    if selected_basis == "source":
+        ibtracs_eval_selected = ibtracs_strict_eval_source
+    elif selected_basis == "valid":
+        ibtracs_eval_selected = ibtracs_strict_eval_valid
+    else:
+        ibtracs_eval_selected = ibtracs_strict_eval
+    basis_flip_flag = False
+    src_margin = _to_float((ibtracs_strict_eval_source or {}).get("event_minus_far_parity_rate"))
+    val_margin = _to_float((ibtracs_strict_eval_valid or {}).get("event_minus_far_parity_rate"))
+    if (src_margin is not None) and (val_margin is not None):
+        basis_flip_flag = bool((src_margin * val_margin) < 0.0 or abs(src_margin - val_margin) >= 0.15)
+    ibtracs_alignment_gate_source = _build_ibtracs_alignment_gate(
+        strict_eval=ibtracs_strict_eval_source,
         min_event_cases=int(args.ibtracs_alignment_min_event_cases),
         min_far_cases=int(args.ibtracs_alignment_min_far_cases),
         margin_min=float(args.ibtracs_alignment_margin_min),
         confound_max=float(args.ibtracs_alignment_confound_max),
     )
+    ibtracs_alignment_gate_valid = _build_ibtracs_alignment_gate(
+        strict_eval=ibtracs_strict_eval_valid,
+        min_event_cases=int(args.ibtracs_alignment_min_event_cases),
+        min_far_cases=int(args.ibtracs_alignment_min_far_cases),
+        margin_min=float(args.ibtracs_alignment_margin_min),
+        confound_max=float(args.ibtracs_alignment_confound_max),
+    )
+    summary["ibtracs_strict_eval"] = ibtracs_strict_eval
+    summary["ibtracs_strict_eval_source"] = ibtracs_strict_eval_source
+    summary["ibtracs_strict_eval_valid"] = ibtracs_strict_eval_valid
+    summary["ibtracs_selected_time_basis"] = selected_basis
+    ibtracs_alignment_gate = _build_ibtracs_alignment_gate(
+        strict_eval=ibtracs_eval_selected,
+        min_event_cases=int(args.ibtracs_alignment_min_event_cases),
+        min_far_cases=int(args.ibtracs_alignment_min_far_cases),
+        margin_min=float(args.ibtracs_alignment_margin_min),
+        confound_max=float(args.ibtracs_alignment_confound_max),
+    )
+    hard_reasons = [str(v) for v in (ibtracs_alignment_gate.get("reason_codes") or [])]
+    warning_reasons: list[str] = []
+    if basis_flip_flag:
+        valid_gate_pass = bool((ibtracs_alignment_gate_valid or {}).get("passed", False))
+        pinned_valid = bool(
+            str(selected_basis).lower() == "valid"
+            and str(canonical_time_basis).lower() == "valid"
+        )
+        if pinned_valid and valid_gate_pass:
+            warning_reasons.append("basis_flip_changes_label")
+        else:
+            hard_reasons.append("basis_flip_changes_label")
+    # Recompute pass/reason fields after hard/warning split.
+    if hard_reasons:
+        hard_counts = pd.Series(hard_reasons, dtype=object).value_counts(dropna=False).to_dict()
+        ibtracs_alignment_gate["reason_codes"] = hard_reasons
+        ibtracs_alignment_gate["reason_code_counts"] = hard_counts
+        ibtracs_alignment_gate["passed"] = False
+        actions = [str(v) for v in (ibtracs_alignment_gate.get("actions") or [])]
+        if any("basis_flip_changes_label" in r for r in hard_reasons):
+            if "compare_source_vs_valid_time_basis_and_lock_one_contract" not in actions:
+                actions.append("compare_source_vs_valid_time_basis_and_lock_one_contract")
+        ibtracs_alignment_gate["actions"] = actions
+        ibtracs_alignment_gate["remediation_hints"] = {
+            str(code): [
+                "compare_source_vs_valid_time_basis_and_lock_one_contract"
+                if "basis_flip_changes_label" in str(code)
+                else "increase_strict_overlay_coverage_or_adjust_split"
+                if "too_few_ibtracs_" in str(code)
+                else "use_valid_time_for_ibtracs_matching"
+                if "time_basis_mismatch" in str(code)
+                else "normalize_longitudes_to_minus180_180_before_matching"
+                if "lon_wrap" in str(code)
+                else "audit_distance_units_and_haversine_inputs"
+                if "distance_units" in str(code)
+                else "calibrate_vortex_center_definition_against_ibtracs"
+                if "center_definition" in str(code)
+                else "verify_event_vs_far_cohort_definition_and_distance_thresholds"
+            ]
+            for code in hard_counts.keys()
+        }
+    ibtracs_alignment_gate["hard_reason_codes"] = [str(v) for v in (ibtracs_alignment_gate.get("reason_codes") or [])]
+    ibtracs_alignment_gate["warning_reason_codes"] = warning_reasons
+    ibtracs_alignment_gate["selected_time_basis"] = selected_basis
+    ibtracs_alignment_gate["source_basis_gate"] = ibtracs_alignment_gate_source
+    ibtracs_alignment_gate["valid_basis_gate"] = ibtracs_alignment_gate_valid
+    ibtracs_alignment_gate["basis_flip_changes_label"] = bool(basis_flip_flag)
     summary["ibtracs_alignment_gate"] = ibtracs_alignment_gate
     claim_reason_codes: list[str] = []
     if not anomaly_mode_gate.get("passed", False):
@@ -792,6 +1897,8 @@ def main() -> int:
         claim_reason_codes.append("non_angular_signal")
     if not ibtracs_alignment_gate.get("passed", False):
         claim_reason_codes.append("ibtracs_alignment_fail")
+    if bool((summary.get("claim_retention_audit", {}).get("starvation", {}) or {}).get("claim_path_event_starvation", False)):
+        claim_reason_codes.append("claim_path_event_starvation")
     if claim_reason_codes:
         claim_mode = "invalid"
     else:
@@ -813,6 +1920,11 @@ def main() -> int:
             *([] if geometry_null_collapse.get("passed", False) else ["geometry_nulls_do_not_collapse_signal"]),
             *([] if angular_witness.get("gate", {}).get("passed", False) else ["angular_witness_fail"]),
             *([] if ibtracs_alignment_gate.get("passed", False) else ["ibtracs_alignment_fail"]),
+            *(
+                []
+                if not bool((summary.get("claim_retention_audit", {}).get("starvation", {}) or {}).get("claim_path_event_starvation", False))
+                else ["claim_path_event_starvation"]
+            ),
         ],
     }
 
@@ -840,6 +1952,7 @@ def main() -> int:
     null_knee_detected = bool(any(bool(v.get("knee_detected", False)) for v in (null_controls or {}).values()))
     null_knee_detected_geometry = bool(
         bool((null_controls or {}).get("theta_roll", {}).get("knee_detected", False))
+        or bool((null_controls or {}).get("center_swap", {}).get("knee_detected", False))
         or bool((null_controls or {}).get("mirror_axis_jitter", {}).get("knee_detected", False))
         or bool((null_controls or {}).get("radial_scramble", {}).get("knee_detected", False))
         or bool((null_controls or {}).get("center_jitter", {}).get("knee_detected", False))
@@ -870,6 +1983,12 @@ def main() -> int:
     )
     summary["parity_confound_dashboard_summary"] = confound_summary
     summary["parity_breakdown"] = _build_parity_breakdown(confound_df, axis_meta=axis_meta)
+    far_clean_df, far_clean_summary = _build_far_cleanliness_dashboard(claim_test_df)
+    summary["far_cleanliness_summary"] = far_clean_summary
+    time_basis_audit = _build_time_basis_audit_from_samples(claim_test_df)
+    center_definition_audit = _build_center_definition_audit_from_samples(claim_test_df)
+    summary["time_basis_audit"] = time_basis_audit
+    summary["center_definition_audit"] = center_definition_audit
 
     ablation_path = out_path.with_name("parity_ablation.json")
     ablation_path.parent.mkdir(parents=True, exist_ok=True)
@@ -891,6 +2010,15 @@ def main() -> int:
     parity_gate_path = out_path.with_name("parity_confound_gate.json")
     parity_gate_path.write_text(json.dumps(parity_confound_gate, indent=2, sort_keys=True), encoding="utf-8")
     summary["parity_confound_gate_path"] = str(parity_gate_path.resolve())
+    strict_cov_path = out_path.with_name("strict_test_coverage.json")
+    strict_cov_path.write_text(json.dumps(summary.get("strict_test_coverage", {}), indent=2, sort_keys=True), encoding="utf-8")
+    summary["strict_test_coverage_path"] = str(strict_cov_path.resolve())
+    strict_cov_train_path = out_path.with_name("strict_train_coverage.json")
+    strict_cov_train_path.write_text(json.dumps(summary.get("strict_train_coverage", {}), indent=2, sort_keys=True), encoding="utf-8")
+    summary["strict_train_coverage_path"] = str(strict_cov_train_path.resolve())
+    shard_manifest_path = out_path.with_name("evaluation_shard_manifest.json")
+    shard_manifest_path.write_text(json.dumps(shard_manifest, indent=2, sort_keys=True), encoding="utf-8")
+    summary["evaluation_shard_manifest_path"] = str(shard_manifest_path.resolve())
     geom_audit_path = out_path.with_name("geometry_null_audit.json")
     geom_audit_path.write_text(json.dumps(geometry_null_audit, indent=2, sort_keys=True), encoding="utf-8")
     summary["geometry_null_audit_path"] = str(geom_audit_path.resolve())
@@ -898,6 +2026,30 @@ def main() -> int:
     confound_path.parent.mkdir(parents=True, exist_ok=True)
     confound_df.to_parquet(confound_path, index=False)
     summary["parity_confound_dashboard_path"] = str(confound_path.resolve())
+    far_clean_path = out_path.with_name("far_cleanliness_dashboard.parquet")
+    far_clean_path.parent.mkdir(parents=True, exist_ok=True)
+    far_clean_df.to_parquet(far_clean_path, index=False)
+    summary["far_cleanliness_dashboard_path"] = str(far_clean_path.resolve())
+    far_clean_summary_path = out_path.with_name("far_cleanliness_summary.json")
+    far_clean_summary_path.write_text(json.dumps(far_clean_summary, indent=2, sort_keys=True), encoding="utf-8")
+    summary["far_cleanliness_summary_path"] = str(far_clean_summary_path.resolve())
+    parity_thresholds_path = out_path.with_name("parity_thresholds.json")
+    parity_thresholds_path.write_text(
+        json.dumps(
+            {
+                "enabled": bool(args.calibrate_parity_thresholds),
+                "applied": summary.get("parity_thresholds_applied", {}),
+                "calibration": summary.get("parity_threshold_calibration", {}),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    summary["parity_thresholds_path"] = str(parity_thresholds_path.resolve())
+    parity_feature_path = out_path.with_name("parity_feature_distributions.parquet")
+    parity_feature_distributions.to_parquet(parity_feature_path, index=False)
+    summary["parity_feature_distributions_path"] = str(parity_feature_path.resolve())
     knee_table_path = out_path.with_name("knee_candidate_table.parquet")
     knee_candidate_table.to_parquet(knee_table_path, index=False)
     summary["knee_candidate_table_path"] = str(knee_table_path.resolve())
@@ -907,9 +2059,27 @@ def main() -> int:
     ibtracs_strict_path = out_path.with_name("ibtracs_strict_eval.json")
     ibtracs_strict_path.write_text(json.dumps(ibtracs_strict_eval, indent=2, sort_keys=True), encoding="utf-8")
     summary["ibtracs_strict_eval_path"] = str(ibtracs_strict_path.resolve())
+    ibtracs_strict_source_path = out_path.with_name("ibtracs_strict_eval_source.json")
+    ibtracs_strict_source_path.write_text(json.dumps(ibtracs_strict_eval_source, indent=2, sort_keys=True), encoding="utf-8")
+    summary["ibtracs_strict_eval_source_path"] = str(ibtracs_strict_source_path.resolve())
+    ibtracs_strict_valid_path = out_path.with_name("ibtracs_strict_eval_valid.json")
+    ibtracs_strict_valid_path.write_text(json.dumps(ibtracs_strict_eval_valid, indent=2, sort_keys=True), encoding="utf-8")
+    summary["ibtracs_strict_eval_valid_path"] = str(ibtracs_strict_valid_path.resolve())
     ibtracs_alignment_path = out_path.with_name("ibtracs_alignment_gate.json")
     ibtracs_alignment_path.write_text(json.dumps(ibtracs_alignment_gate, indent=2, sort_keys=True), encoding="utf-8")
     summary["ibtracs_alignment_gate_path"] = str(ibtracs_alignment_path.resolve())
+    time_basis_audit_path = out_path.with_name("time_basis_audit.json")
+    time_basis_audit_path.write_text(json.dumps(time_basis_audit, indent=2, sort_keys=True), encoding="utf-8")
+    summary["time_basis_audit_path"] = str(time_basis_audit_path.resolve())
+    center_definition_audit_path = out_path.with_name("center_definition_audit.json")
+    center_definition_audit_path.write_text(json.dumps(center_definition_audit, indent=2, sort_keys=True), encoding="utf-8")
+    summary["center_definition_audit_path"] = str(center_definition_audit_path.resolve())
+    claim_retention_audit_path = out_path.with_name("claim_retention_audit.json")
+    claim_retention_audit_path.write_text(
+        json.dumps(summary.get("claim_retention_audit", {}), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    summary["claim_retention_audit_path"] = str(claim_retention_audit_path.resolve())
 
     claim_contract = _build_claim_contract(
         summary=summary,
@@ -967,8 +2137,9 @@ def _with_observable_mode(samples: pd.DataFrame, *, mode: str) -> pd.DataFrame:
     if col not in out.columns:
         return out
     vals = pd.to_numeric(out[col], errors="coerce")
-    out["O"] = vals
-    out = out.loc[np.isfinite(out["O"]) & (out["O"] > 0)].copy()
+    fallback = pd.to_numeric(out.get("O"), errors="coerce")
+    out["O"] = _sanitize_observable_series(vals, fallback=fallback)
+    out["anomaly_mode_claim"] = str(mode)
     return out
 
 
@@ -985,7 +2156,8 @@ def _with_observable_mode_by_lead(
         return _with_observable_mode(out, mode=default_mode)
     out["lead_bucket"] = out["lead_bucket"].astype(str)
     out["anomaly_mode_claim"] = out["lead_bucket"].map(lambda x: str(mode_by_lead.get(str(x), default_mode)))
-    o_vals = pd.to_numeric(out.get("O"), errors="coerce")
+    fallback_o = pd.to_numeric(out.get("O"), errors="coerce")
+    o_vals = fallback_o.copy()
     for lead, idx in out.groupby("lead_bucket", dropna=False).groups.items():
         lead_key = str(lead)
         mode = str(mode_by_lead.get(lead_key, default_mode))
@@ -997,9 +2169,42 @@ def _with_observable_mode_by_lead(
         vals = pd.to_numeric(out.loc[idx, col], errors="coerce")
         o_vals.loc[idx] = vals
         out.loc[idx, "anomaly_mode_claim"] = mode
-    out["O"] = o_vals
-    out = out.loc[np.isfinite(out["O"]) & (out["O"] > 0)].copy()
+    out["O"] = _sanitize_observable_series(o_vals, fallback=fallback_o)
     return out
+
+
+def _sanitize_observable_series(
+    values: pd.Series,
+    *,
+    fallback: pd.Series | None = None,
+) -> pd.Series:
+    """Assign claim observable without row-starvation.
+
+    The claim path must be case-first. This helper keeps rows and guarantees a positive
+    observable for downstream pipeline calls:
+    1) use finite positive selected-mode values,
+    2) fallback to prior O if available and positive,
+    3) use absolute selected-mode magnitude,
+    4) final epsilon floor.
+    """
+    v = pd.to_numeric(values, errors="coerce").copy()
+    if fallback is None:
+        fb = pd.Series(np.nan, index=v.index, dtype=float)
+    else:
+        fb = pd.to_numeric(fallback, errors="coerce").reindex(v.index)
+
+    out = v.copy()
+    bad = (~np.isfinite(out)) | (out <= 0.0)
+    if bool(bad.any()):
+        out.loc[bad] = fb.loc[bad]
+    bad = (~np.isfinite(out)) | (out <= 0.0)
+    if bool(bad.any()):
+        abs_v = np.abs(v)
+        out.loc[bad] = abs_v.loc[bad]
+    bad = (~np.isfinite(out)) | (out <= 0.0)
+    if bool(bad.any()):
+        out.loc[bad] = 1e-8
+    return pd.to_numeric(out, errors="coerce").fillna(1e-8).astype(float)
 
 
 def _score_mode_from_samples(
@@ -1227,11 +2432,40 @@ def _build_parity_confound_gate(
     confound_max_ratio: float,
     event_minus_far_min: float,
     far_nonstorm_max: float,
+    use_alignment_fraction: bool = True,
 ) -> dict[str, Any]:
     events = (strata_test or {}).get("events", {}) or {}
     far = (strata_test or {}).get("far_nonstorm", {}) or {}
-    event_rate = float(events.get("parity_signal_rate", 0.0))
-    far_rate = float(far.get("parity_signal_rate", 0.0))
+    if bool(use_alignment_fraction):
+        align_event = _to_float(events.get("alignment_event_weighted_rate"))
+        align_far = _to_float(far.get("alignment_far_weighted_rate"))
+        if align_event is None:
+            align_event = _to_float(events.get("alignment_fraction_rate"))
+        if align_far is None:
+            align_far = _to_float(far.get("alignment_fraction_rate"))
+        parity_event = _to_float(events.get("parity_signal_rate"))
+        parity_far = _to_float(far.get("parity_signal_rate"))
+        if (align_event is not None) and (align_far is not None) and (parity_event is not None) and (parity_far is not None):
+            # Storm-local alignment should require both intermittent alignment and parity activation.
+            event_rate = float((2.0 * float(align_event) * float(parity_event)) / max(float(align_event) + float(parity_event), 1e-9))
+            far_rate = float((2.0 * float(align_far) * float(parity_far)) / max(float(align_far) + float(parity_far), 1e-9))
+            rate_basis = "alignment_parity_hmean"
+        else:
+            event_rate = align_event
+            far_rate = align_far
+            rate_basis = "alignment_fraction"
+    else:
+        event_rate = None
+        far_rate = None
+        rate_basis = "parity_signal_rate"
+    if event_rate is None:
+        event_rate = float(events.get("parity_signal_rate", 0.0))
+        rate_basis = "parity_signal_rate_fallback"
+    if far_rate is None:
+        far_rate = float(far.get("parity_signal_rate", 0.0))
+        rate_basis = "parity_signal_rate_fallback"
+    event_rate = float(event_rate)
+    far_rate = float(far_rate)
     eps = 1e-9
     confound_ratio = float(far_rate / max(event_rate, eps))
     margin = float(event_rate - far_rate)
@@ -1250,6 +2484,7 @@ def _build_parity_confound_gate(
         "confound_max_ratio": float(confound_max_ratio),
         "event_minus_far_min": float(event_minus_far_min),
         "far_nonstorm_max": float(far_nonstorm_max),
+        "rate_basis": str(rate_basis),
     }
 
 
@@ -1259,36 +2494,72 @@ def _build_geometry_null_collapse_gate(
     null_strata: dict[str, dict[str, Any]],
     min_rel_drop: float,
     min_abs_drop: float,
-    required_checks: tuple[str, ...] = ("theta_roll", "center_jitter"),
+    rate_key: str = "parity_signal_rate",
+    no_signal_max_rate: float = 0.05,
+    required_checks: tuple[str, ...] = ("theta_roll", "center_swap", "storm_track_reassignment", "time_permutation_within_lead"),
+    center_swap_distance_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     events = (observed_strata or {}).get("events", {}) or {}
-    observed = float(events.get("parity_signal_rate", 0.0))
+    observed = _to_float(events.get(str(rate_key)))
+    if observed is None:
+        observed = float(events.get("parity_signal_rate", 0.0))
+    observed = float(observed)
+    no_signal = bool(observed <= float(no_signal_max_rate))
     rows: dict[str, Any] = {}
     passed = True
     check_names = [str(k) for k in (null_strata or {}).keys()]
     for name in check_names:
         strata = (null_strata or {}).get(name, {}) or {}
         null_events = (strata or {}).get("events", {}) or {}
-        null_rate = float(null_events.get("parity_signal_rate", 0.0))
+        null_rate_v = _to_float(null_events.get(str(rate_key)))
+        if null_rate_v is None:
+            null_rate_v = float(null_events.get("parity_signal_rate", 0.0))
+        null_rate = float(null_rate_v)
         abs_drop = float(observed - null_rate)
         rel_drop = float(abs_drop / max(observed, 1e-9))
-        ok = bool((abs_drop >= float(min_abs_drop)) and (rel_drop >= float(min_rel_drop)))
+        if no_signal:
+            ok = bool(null_rate <= float(no_signal_max_rate))
+            mode = "not_applicable_no_signal"
+        else:
+            ok = bool((abs_drop >= float(min_abs_drop)) and (rel_drop >= float(min_rel_drop)))
+            mode = "signal_collapse"
         required = str(name) in set(str(v) for v in required_checks)
+        center_distance_ok = True
+        if str(name) == "center_swap":
+            dist = center_swap_distance_stats or {}
+            p50 = _to_float(dist.get("p50_km"))
+            p10 = _to_float(dist.get("p10_km"))
+            center_distance_ok = bool((p50 is not None and p50 >= 800.0) and (p10 is not None and p10 >= 500.0))
+            if not bool(no_signal):
+                ok = bool(ok and center_distance_ok)
         rows[name] = {
             "event_parity_rate_observed": observed,
             "event_parity_rate_null": null_rate,
             "absolute_drop": abs_drop,
             "relative_drop": rel_drop,
+            "mode": mode,
             "required": bool(required),
             "passed": ok,
         }
+        if str(name) == "center_swap":
+            rows[name]["center_swap_distance_stats"] = dict(center_swap_distance_stats or {})
+            rows[name]["center_swap_distance_gate"] = {
+                "p50_km_min": 800.0,
+                "p10_km_min": 500.0,
+                "passed": bool(center_distance_ok),
+                "applied": bool(not no_signal),
+            }
         if required:
             passed = passed and ok
     return {
         "passed": bool(passed),
         "min_relative_drop": float(min_rel_drop),
         "min_absolute_drop": float(min_abs_drop),
+        "rate_key": str(rate_key),
+        "no_signal_mode": bool(no_signal),
+        "no_signal_max_rate": float(no_signal_max_rate),
         "required_checks": [str(v) for v in required_checks],
+        "center_swap_distance_stats": dict(center_swap_distance_stats or {}),
         "checks": rows,
     }
 
@@ -1505,11 +2776,11 @@ def _build_case_meta(samples: pd.DataFrame, storm_id_col: str | None) -> pd.Data
         center_source = str(grp["center_source"].iloc[0]) if "center_source" in grp.columns and grp["center_source"].notna().any() else None
         control_tier = str(grp["control_tier"].iloc[0]) if "control_tier" in grp.columns and grp["control_tier"].notna().any() else None
         match_quality = str(grp["match_quality"].iloc[0]) if "match_quality" in grp.columns and grp["match_quality"].notna().any() else None
-        storm_distance_cohort = (
-            str(grp["storm_distance_cohort"].iloc[0])
-            if "storm_distance_cohort" in grp.columns and grp["storm_distance_cohort"].notna().any()
-            else None
-        )
+        storm_distance_cohort = None
+        if "storm_distance_cohort" in grp.columns and grp["storm_distance_cohort"].notna().any():
+            cohort_series = grp["storm_distance_cohort"].dropna().astype(str)
+            if not cohort_series.empty:
+                storm_distance_cohort = str(cohort_series.value_counts().idxmax())
         storm_id = None
         if storm_id_col and storm_id_col in grp.columns:
             vals = grp[storm_id_col].dropna()
@@ -1529,6 +2800,15 @@ def _build_case_meta(samples: pd.DataFrame, storm_id_col: str | None) -> pd.Data
                 "storm_max": int(pd.to_numeric(grp.get("storm", 0), errors="coerce").fillna(0).max()),
                 "near_storm_max": int(pd.to_numeric(grp.get("near_storm", 0), errors="coerce").fillna(0).max()),
                 "pregen_max": int(pd.to_numeric(grp.get("pregen", 0), errors="coerce").fillna(0).max()),
+                "ib_event_max": int((pd.to_numeric(grp.get("ib_event", 0), errors="coerce").fillna(0) > 0).any()),
+                "ib_far_max": int((pd.to_numeric(grp.get("ib_far", 0), errors="coerce").fillna(0) > 0).any()),
+                "ib_event_strict_max": int((pd.to_numeric(grp.get("ib_event_strict", grp.get("ib_event", 0)), errors="coerce").fillna(0) > 0).any()),
+                "ib_far_strict_max": int((pd.to_numeric(grp.get("ib_far_strict", grp.get("ib_far", 0)), errors="coerce").fillna(0) > 0).any()),
+                "ib_far_quality_tag": (
+                    str(grp["ib_far_quality_tag"].dropna().astype(str).value_counts().idxmax())
+                    if "ib_far_quality_tag" in grp.columns and grp["ib_far_quality_tag"].notna().any()
+                    else None
+                ),
                 "storm_id": storm_id,
             }
         )
@@ -1536,7 +2816,9 @@ def _build_case_meta(samples: pd.DataFrame, storm_id_col: str | None) -> pd.Data
     if out.empty:
         return out
     out["anchor_time"] = pd.to_datetime(out["anchor_time"], errors="coerce")
-    return out.dropna(subset=["anchor_time"]).reset_index(drop=True)
+    out = out.dropna(subset=["anchor_time"]).reset_index(drop=True)
+    out["split_stratum"] = _derive_strata_labels(out)
+    return out
 
 
 def _blocked_time_split(case_meta: pd.DataFrame, split_date: pd.Timestamp, buffer_hours: float) -> dict[str, set[str]]:
@@ -1656,15 +2938,7 @@ def _split_stratum_counts(*, case_meta: pd.DataFrame, case_ids: set[str]) -> dic
     sub = case_meta.loc[case_meta["case_id"].astype(str).isin(case_ids)].copy()
     if sub.empty:
         return {"counts": {"events": 0, "near_storm": 0, "far_nonstorm": 0, "other": 0}, "by_lead": {}}
-    storm = pd.to_numeric(sub.get("storm_max"), errors="coerce").fillna(0).astype(int)
-    near = pd.to_numeric(sub.get("near_storm_max"), errors="coerce").fillna(0).astype(int)
-    pregen = pd.to_numeric(sub.get("pregen_max"), errors="coerce").fillna(0).astype(int)
-    labels = np.where(
-        (storm == 1) | (pregen == 1),
-        "events",
-        np.where(near == 1, "near_storm", np.where((storm == 0) & (near == 0) & (pregen == 0), "far_nonstorm", "other")),
-    )
-    sub["split_stratum"] = labels
+    sub["split_stratum"] = _derive_strata_labels(sub)
     sub["lead_bucket"] = sub["lead_bucket"].astype(str)
     counts = sub["split_stratum"].value_counts(dropna=False).to_dict()
     by_lead = {
@@ -1716,6 +2990,156 @@ def _time_buffer_violation_stats(
     return violations, min_gap_hours
 
 
+def _compute_parity_localization_metrics(
+    case_df: pd.DataFrame,
+    *,
+    inner_quantile: float,
+) -> dict[str, float | None]:
+    out: dict[str, float | None] = {
+        "odd_inner": None,
+        "odd_outer": None,
+        "odd_inner_outer_ratio": None,
+        "tangential_radial_ratio": None,
+    }
+    if case_df is None or case_df.empty:
+        return out
+
+    odd_col = None
+    for col in ("O_polar_eta", "O_polar_odd_ratio", "O_polar_chiral"):
+        if col in case_df.columns:
+            odd_col = col
+            break
+    if odd_col is not None and "L" in case_df.columns:
+        lvals = pd.to_numeric(case_df.get("L"), errors="coerce").to_numpy(dtype=float)
+        odd_vals = np.abs(pd.to_numeric(case_df.get(odd_col), errors="coerce").to_numpy(dtype=float))
+        valid = np.isfinite(lvals) & np.isfinite(odd_vals) & (lvals > 0)
+        if np.any(valid):
+            lv = lvals[valid]
+            ov = odd_vals[valid]
+            q = float(np.nanquantile(lv, min(max(float(inner_quantile), 0.05), 0.95)))
+            inner = ov[lv <= q]
+            outer = ov[lv > q]
+            if inner.size > 0 and outer.size > 0:
+                odd_inner = float(np.nanmedian(inner))
+                odd_outer = float(np.nanmedian(outer))
+                out["odd_inner"] = odd_inner
+                out["odd_outer"] = odd_outer
+                out["odd_inner_outer_ratio"] = float(odd_inner / max(odd_outer, 1e-9))
+
+    if "O_polar_tangential" in case_df.columns and "O_polar_radial" in case_df.columns:
+        vt = np.abs(pd.to_numeric(case_df.get("O_polar_tangential"), errors="coerce").to_numpy(dtype=float))
+        vr = np.abs(pd.to_numeric(case_df.get("O_polar_radial"), errors="coerce").to_numpy(dtype=float))
+        valid = np.isfinite(vt) & np.isfinite(vr)
+        if np.any(valid):
+            ratio = vt[valid] / (vr[valid] + 1e-9)
+            if ratio.size > 0:
+                out["tangential_radial_ratio"] = float(np.nanmedian(ratio))
+    return out
+
+
+def _compute_alignment_metrics(
+    case_df: pd.DataFrame,
+    *,
+    eta_threshold: float,
+    block_hours: float,
+) -> dict[str, float]:
+    out = {
+        "eventness": 0.0,
+        "farness": 0.0,
+        "A_align": 0.0,
+        "S_align": 0.0,
+        "A_align_event": 0.0,
+        "A_align_far": 0.0,
+        "S_align_event": 0.0,
+        "S_align_far": 0.0,
+        "n_align_times": 0.0,
+        "n_align_blocks": 0.0,
+    }
+    if case_df is None or case_df.empty:
+        return out
+    if "hand" not in case_df.columns or "O" not in case_df.columns:
+        return out
+    time_col = "t" if "t" in case_df.columns else ("t_valid" if "t_valid" in case_df.columns else None)
+    if time_col is None:
+        return out
+
+    df = case_df.copy()
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df["L_scale"] = pd.to_numeric(df.get("L"), errors="coerce")
+    df["O"] = pd.to_numeric(df.get("O"), errors="coerce")
+    df = df.dropna(subset=[time_col, "L_scale", "O"]).copy()
+    if df.empty:
+        return out
+
+    pair = df.pivot_table(index=[time_col, "L_scale"], columns="hand", values="O", aggfunc="first").reset_index()
+    if ("L" not in pair.columns) or ("R" not in pair.columns):
+        # hand columns did not materialize
+        return out
+    o_l = pd.to_numeric(pair["L"], errors="coerce").to_numpy(dtype=float)
+    o_r = pd.to_numeric(pair["R"], errors="coerce").to_numpy(dtype=float)
+    denom = 0.5 * (o_l + o_r)
+    valid = np.isfinite(o_l) & np.isfinite(o_r) & np.isfinite(denom) & (denom > 1e-12)
+    eta = np.full(o_l.shape, np.nan, dtype=float)
+    eta[valid] = np.abs(o_l[valid] - o_r[valid]) / denom[valid]
+    pair["eta_tl"] = eta
+    pair = pair.dropna(subset=["eta_tl"]).copy()
+    if pair.empty:
+        return out
+
+    t_key = time_col
+    eta_t = pair.groupby(t_key, as_index=False).agg(eta_t=("eta_tl", "median"), n_scales=("eta_tl", "count"))
+    meta = df.groupby(t_key, as_index=False).agg(
+        w_event_t=("w_event", "median") if "w_event" in df.columns else ("O", "size"),
+        w_far_t=("w_far", "median") if "w_far" in df.columns else ("O", "size"),
+    )
+    eta_t = eta_t.merge(meta, on=t_key, how="left")
+    if "w_event_t" not in eta_t.columns:
+        eta_t["w_event_t"] = 0.0
+    if "w_far_t" not in eta_t.columns:
+        eta_t["w_far_t"] = 0.0
+    eta_t["w_event_t"] = pd.to_numeric(eta_t["w_event_t"], errors="coerce").fillna(0.0)
+    eta_t["w_far_t"] = pd.to_numeric(eta_t["w_far_t"], errors="coerce").fillna(0.0)
+
+    thr = max(float(eta_threshold), 0.0)
+    eta_vals = pd.to_numeric(eta_t["eta_t"], errors="coerce").to_numpy(dtype=float)
+    pass_t = (eta_vals >= thr).astype(float)
+    event_w = pd.to_numeric(eta_t["w_event_t"], errors="coerce").to_numpy(dtype=float)
+    far_w = pd.to_numeric(eta_t["w_far_t"], errors="coerce").to_numpy(dtype=float)
+
+    bh = max(float(block_hours), 0.0)
+    n_blocks = 0
+    if bh > 0:
+        freq = f"{max(int(round(bh)), 1)}h"
+        eta_t["time_block"] = pd.to_datetime(eta_t[t_key], errors="coerce").dt.floor(freq)
+        n_blocks = int(eta_t["time_block"].nunique(dropna=True))
+    out.update(
+        {
+            "eventness": float(np.nanmean(event_w)) if event_w.size else 0.0,
+            "farness": float(np.nanmean(far_w)) if far_w.size else 0.0,
+            "A_align": float(np.nanmean(pass_t)) if pass_t.size else 0.0,
+            "S_align": float(np.nanmean(eta_vals)) if eta_vals.size else 0.0,
+            "A_align_event": _weighted_mean_np(pass_t, event_w),
+            "A_align_far": _weighted_mean_np(pass_t, far_w),
+            "S_align_event": _weighted_mean_np(eta_vals, event_w),
+            "S_align_far": _weighted_mean_np(eta_vals, far_w),
+            "n_align_times": float(len(eta_t)),
+            "n_align_blocks": float(n_blocks),
+        }
+    )
+    return out
+
+
+def _weighted_mean_np(values: np.ndarray, weights: np.ndarray) -> float:
+    if values.size == 0 or weights.size == 0:
+        return 0.0
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    valid = np.isfinite(v) & np.isfinite(w) & (w > 0.0)
+    if not np.any(valid):
+        return 0.0
+    return float(np.sum(v[valid] * w[valid]) / max(np.sum(w[valid]), 1e-12))
+
+
 def _evaluate_cases(
     samples: pd.DataFrame,
     *,
@@ -1724,6 +3148,11 @@ def _evaluate_cases(
     seed: int,
     enable_time_frequency_knee: bool,
     tf_knee_bic_delta_min: float,
+    parity_odd_inner_outer_min: float = 0.0,
+    parity_tangential_radial_min: float = 0.0,
+    parity_inner_ring_quantile: float = 0.5,
+    alignment_eta_threshold: float = 0.10,
+    alignment_block_hours: float = 3.0,
 ) -> pd.DataFrame:
     if samples.empty:
         return pd.DataFrame(
@@ -1738,6 +3167,12 @@ def _evaluate_cases(
                 "storm_max",
                 "near_storm_max",
                 "pregen_max",
+                "ib_event_max",
+                "ib_far_max",
+                "ib_event_strict_max",
+                "ib_far_strict_max",
+                "ib_far_quality_tag",
+                "split_stratum",
                 "knee_detected",
                 "knee_size_detected",
                 "knee_confidence",
@@ -1766,6 +3201,22 @@ def _evaluate_cases(
                 "tf_knee_consistency_cv",
                 "tf_knee_null_gate_pass",
                 "knee_detected_effective",
+                "parity_localization_pass",
+                "parity_tangential_pass",
+                "odd_energy_inner",
+                "odd_energy_outer",
+                "odd_energy_inner_outer_ratio",
+                "tangential_radial_ratio",
+                "eventness",
+                "farness",
+                "A_align",
+                "S_align",
+                "A_align_event",
+                "A_align_far",
+                "S_align_event",
+                "S_align_far",
+                "n_align_times",
+                "n_align_blocks",
                 "run_error",
             ]
         )
@@ -1794,8 +3245,26 @@ def _evaluate_cases(
             )
             tf_fallback_accept = bool(tf_null_gate and bool(tf_metrics.get("consistent", False)))
         knee_detected_effective = bool(base_knee or tf_fallback_accept)
-        out_rows.append(
-            {
+        parity_local = _compute_parity_localization_metrics(
+            case_df,
+            inner_quantile=float(parity_inner_ring_quantile),
+        )
+        odd_ratio = _to_float(parity_local.get("odd_inner_outer_ratio"))
+        tan_ratio = _to_float(parity_local.get("tangential_radial_ratio"))
+        parity_localization_pass = bool(
+            odd_ratio is not None and odd_ratio >= float(parity_odd_inner_outer_min)
+        )
+        parity_tangential_pass = bool(
+            tan_ratio is not None and tan_ratio >= float(parity_tangential_radial_min)
+        )
+        parity_signal_pass = bool(result.get("parity_signal_pass", False))
+        parity_signal_pass = bool(parity_signal_pass and parity_localization_pass and parity_tangential_pass)
+        align = _compute_alignment_metrics(
+            case_df,
+            eta_threshold=float(alignment_eta_threshold),
+            block_hours=float(alignment_block_hours),
+        )
+        case_row = {
                 "case_id": str(case_id),
                 "case_type": str(case_df["case_type"].iloc[0]) if "case_type" in case_df.columns else "unknown",
                 "center_source": (
@@ -1810,7 +3279,7 @@ def _evaluate_cases(
                 ),
                 "lead_bucket": str(case_df["lead_bucket"].iloc[0]) if "lead_bucket" in case_df.columns else None,
                 "storm_distance_cohort": (
-                    str(case_df["storm_distance_cohort"].iloc[0])
+                    str(case_df["storm_distance_cohort"].dropna().astype(str).value_counts().idxmax())
                     if "storm_distance_cohort" in case_df.columns and case_df["storm_distance_cohort"].notna().any()
                     else None
                 ),
@@ -1818,11 +3287,36 @@ def _evaluate_cases(
                 "storm_max": int(pd.to_numeric(case_df.get("storm", 0), errors="coerce").fillna(0).max()),
                 "near_storm_max": int(pd.to_numeric(case_df.get("near_storm", 0), errors="coerce").fillna(0).max()),
                 "pregen_max": int(pd.to_numeric(case_df.get("pregen", 0), errors="coerce").fillna(0).max()),
+                "ib_event_max": int((pd.to_numeric(case_df.get("ib_event", 0), errors="coerce").fillna(0) > 0).any()),
+                "ib_far_max": int((pd.to_numeric(case_df.get("ib_far", 0), errors="coerce").fillna(0) > 0).any()),
+                "ib_event_strict_max": int((pd.to_numeric(case_df.get("ib_event_strict", case_df.get("ib_event", 0)), errors="coerce").fillna(0) > 0).any()),
+                "ib_far_strict_max": int((pd.to_numeric(case_df.get("ib_far_strict", case_df.get("ib_far", 0)), errors="coerce").fillna(0) > 0).any()),
+                "ib_far_quality_tag": (
+                    str(case_df["ib_far_quality_tag"].dropna().astype(str).value_counts().idxmax())
+                    if "ib_far_quality_tag" in case_df.columns and case_df["ib_far_quality_tag"].notna().any()
+                    else None
+                ),
                 "knee_detected": bool(result.get("knee_detected", False)),
                 "knee_size_detected": bool(result.get("knee_detected", False)),
                 "knee_confidence": _to_float(result.get("knee_confidence")),
                 "P_lock": _to_float(result.get("P_lock")),
-                "parity_signal_pass": bool(result.get("parity_signal_pass", False)),
+                "parity_signal_pass": bool(parity_signal_pass),
+                "parity_localization_pass": bool(parity_localization_pass),
+                "parity_tangential_pass": bool(parity_tangential_pass),
+                "odd_energy_inner": _to_float(parity_local.get("odd_inner")),
+                "odd_energy_outer": _to_float(parity_local.get("odd_outer")),
+                "odd_energy_inner_outer_ratio": odd_ratio,
+                "tangential_radial_ratio": tan_ratio,
+                "eventness": _to_float(align.get("eventness")),
+                "farness": _to_float(align.get("farness")),
+                "A_align": _to_float(align.get("A_align")),
+                "S_align": _to_float(align.get("S_align")),
+                "A_align_event": _to_float(align.get("A_align_event")),
+                "A_align_far": _to_float(align.get("A_align_far")),
+                "S_align_event": _to_float(align.get("S_align_event")),
+                "S_align_far": _to_float(align.get("S_align_far")),
+                "n_align_times": _to_float(align.get("n_align_times")),
+                "n_align_blocks": _to_float(align.get("n_align_blocks")),
                 "band_class_hat": result.get("band_class_hat"),
                 "R_Omega": _to_float(result.get("R_Omega")),
                 "ridge_strength": _to_float(result.get("ridge_strength")),
@@ -1848,7 +3342,8 @@ def _evaluate_cases(
                 "knee_detected_effective": bool(knee_detected_effective),
                 "run_error": result.get("run_error"),
             }
-        )
+        case_row["split_stratum"] = str(_derive_strata_labels(pd.DataFrame([case_row])).iloc[0])
+        out_rows.append(case_row)
     return pd.DataFrame(out_rows)
 
 
@@ -1958,18 +3453,109 @@ def _spatial_shuffle_control(samples: pd.DataFrame, rng: np.random.Generator) ->
     return pd.concat(out, ignore_index=True)
 
 
+def _phase_bucket_for_null(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=object)
+    if "storm_phase" in df.columns:
+        s = df["storm_phase"].fillna("").astype(str).str.strip().str.lower()
+        if bool((s != "").any()):
+            return s.replace("", "unknown")
+    if "t_rel_h" in df.columns and "case_id" in df.columns:
+        t_rel = pd.to_numeric(df["t_rel_h"], errors="coerce")
+        out = pd.Series("unknown", index=df.index, dtype=object)
+        for _, grp in df.groupby("case_id", dropna=False):
+            idx = grp.index
+            vals = pd.to_numeric(grp.get("t_rel_h"), errors="coerce")
+            finite = vals[np.isfinite(vals)]
+            if finite.shape[0] < 4:
+                out.loc[idx] = "unknown"
+                continue
+            q1 = float(np.nanquantile(finite, 0.25))
+            q2 = float(np.nanquantile(finite, 0.50))
+            q3 = float(np.nanquantile(finite, 0.75))
+            v = vals.to_numpy(dtype=float)
+            labels = np.full(v.shape[0], "unknown", dtype=object)
+            labels[np.isfinite(v) & (v <= q1)] = "phase_q1"
+            labels[np.isfinite(v) & (v > q1) & (v <= q2)] = "phase_q2"
+            labels[np.isfinite(v) & (v > q2) & (v <= q3)] = "phase_q3"
+            labels[np.isfinite(v) & (v > q3)] = "phase_q4"
+            out.loc[idx] = labels
+        return out
+    return pd.Series("unknown", index=df.index, dtype=object)
+
+
 def _time_permutation_within_lead(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
     if samples.empty:
         return samples.copy()
     df = samples.copy()
+    if "lead_bucket" not in df.columns:
+        df["lead_bucket"] = "none"
+    df["_phase_bucket"] = _phase_bucket_for_null(df)
+    # Phase-aware permutation: keep lead and phase distributions, break within-track temporal ordering.
+    key_cols = [c for c in ("lead_bucket", "_phase_bucket", "L", "hand") if c in df.columns]
+    if "case_id" in df.columns and "storm_id" in df.columns:
+        # Keep case-local structure from surviving by forcing cross-case shuffles inside the same phase bucket.
+        key_cols = [c for c in key_cols if c != "case_id"]
+    if not key_cols:
+        key_cols = [c for c in ("lead_bucket", "L", "hand") if c in df.columns]
     out = []
-    for _, grp in df.groupby(["lead_bucket", "L", "hand"], dropna=False):
+    shuffle_cols = [c for c in ("O", "O_polar_chiral", "O_polar_eta", "O_polar_odd_ratio", "O_polar_left", "O_polar_right") if c in df.columns]
+    if not shuffle_cols:
+        shuffle_cols = ["O"] if "O" in df.columns else []
+    for _, grp in df.groupby(key_cols, dropna=False):
         g = grp.copy()
-        vals = g["O"].to_numpy(dtype=float)
-        rng.shuffle(vals)
-        g["O"] = vals
+        if g.shape[0] <= 1:
+            out.append(g)
+            continue
+        perm = rng.permutation(g.index.to_numpy())
+        for col in shuffle_cols:
+            vals = pd.to_numeric(df.loc[perm, col], errors="coerce").to_numpy(dtype=float)
+            if vals.size == g.shape[0]:
+                if col == "O":
+                    vals = np.where(np.isfinite(vals), np.maximum(vals, 1e-8), vals)
+                g[col] = vals
         out.append(g)
-    return pd.concat(out, ignore_index=True)
+    out_df = pd.concat(out, ignore_index=True)
+    if "_phase_bucket" in out_df.columns:
+        out_df = out_df.drop(columns=["_phase_bucket"])
+    return out_df
+
+
+def _lat_band_shuffle_within_month_hour(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    if samples.empty:
+        return samples.copy()
+    df = samples.copy()
+    if "t" not in df.columns:
+        return _time_permutation_within_lead(samples, rng)
+    ts = pd.to_datetime(df["t"], errors="coerce")
+    df["_month"] = ts.dt.month.astype("Int64")
+    df["_hour"] = ts.dt.hour.astype("Int64")
+    lat_src = pd.to_numeric(df.get("lat0", df.get("lat")), errors="coerce")
+    if lat_src is None:
+        return _time_permutation_within_lead(samples, rng)
+    df["_lat_bin"] = (np.floor(lat_src / 2.0) * 2.0).astype(float)
+    key_cols = [c for c in ("lead_bucket", "_month", "_hour", "_lat_bin", "L", "hand") if c in df.columns]
+    if len(key_cols) < 3:
+        return _time_permutation_within_lead(samples, rng)
+    shuffle_cols = [c for c in ("O", "O_scalar", "O_raw", "O_vector", "O_local_frame", "O_meanflow", "O_vorticity", "O_lat_hour", "O_lat_day") if c in df.columns]
+    shuffle_cols.extend([c for c in df.columns if str(c).startswith("O_polar_") and c not in shuffle_cols])
+    out_frames: list[pd.DataFrame] = []
+    for _, grp in df.groupby(key_cols, dropna=False):
+        g = grp.copy()
+        if g.shape[0] <= 1:
+            out_frames.append(g)
+            continue
+        perm = rng.permutation(g.index.to_numpy())
+        for col in shuffle_cols:
+            src = pd.to_numeric(df.loc[perm, col], errors="coerce").to_numpy(dtype=float)
+            if src.size == g.shape[0]:
+                g[col] = src
+        out_frames.append(g)
+    out = pd.concat(out_frames, ignore_index=True)
+    for c in ("_month", "_hour", "_lat_bin"):
+        if c in out.columns:
+            out = out.drop(columns=[c])
+    return out
 
 
 def _fake_mirror_pairing(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
@@ -2150,9 +3736,92 @@ def _theta_roll_polar(samples: pd.DataFrame, rng: np.random.Generator) -> pd.Dat
                 shift = int(rng.integers(1, vals.size))
                 rolled = np.roll(vals, shift=shift)
                 g["O_polar_spiral"] = np.where(np.isfinite(rolled), 0.8 * rolled, rolled)
+        if "O_polar_tangential" in g.columns and "O_polar_radial" in g.columns:
+            vt = pd.to_numeric(g["O_polar_tangential"], errors="coerce").to_numpy(dtype=float)
+            vr = pd.to_numeric(g["O_polar_radial"], errors="coerce").to_numpy(dtype=float)
+            if vt.size > 0 and vr.size > 0:
+                mix = 0.5 * (np.nan_to_num(vt, nan=0.0) + np.nan_to_num(vr, nan=0.0))
+                noise = rng.normal(loc=0.0, scale=max(1e-8, 0.05 * float(np.nanmedian(np.abs(mix))) if np.isfinite(mix).any() else 1e-8), size=mix.size)
+                g["O_polar_tangential"] = np.maximum(mix + noise, 1e-8)
+                g["O_polar_radial"] = np.maximum(mix - noise, 1e-8)
 
         out.append(g)
     return pd.concat(out, ignore_index=True)
+
+
+def _theta_scramble_within_ring(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    if samples.empty:
+        return samples.copy()
+    claim_cols = [
+        c
+        for c in (
+            "O",
+            "O_polar_chiral",
+            "O_polar_eta",
+            "O_polar_odd_ratio",
+            "O_polar_left",
+            "O_polar_right",
+            "O_polar_tangential",
+            "O_polar_radial",
+        )
+        if c in samples.columns
+    ]
+    if not claim_cols:
+        return _time_permutation_within_lead(samples, rng)
+    df = samples.copy()
+    out_frames: list[pd.DataFrame] = []
+    group_cols = [c for c in ("case_id", "t", "L") if c in df.columns]
+    if not group_cols:
+        group_cols = [c for c in ("case_id", "L") if c in df.columns]
+    if not group_cols:
+        return _time_permutation_within_lead(samples, rng)
+    for _, grp in df.groupby(group_cols, dropna=False):
+        g = grp.copy()
+        left_idx = g.loc[g.get("hand", pd.Series(index=g.index)).astype(str) == "L"].index.to_numpy()
+        right_idx = g.loc[g.get("hand", pd.Series(index=g.index)).astype(str) == "R"].index.to_numpy()
+        n_pairs = int(min(left_idx.size, right_idx.size))
+        if n_pairs <= 0:
+            out_frames.append(g)
+            continue
+        if "O" in g.columns:
+            o_l = pd.to_numeric(g.loc[left_idx[:n_pairs], "O"], errors="coerce").to_numpy(dtype=float)
+            o_r = pd.to_numeric(g.loc[right_idx[:n_pairs], "O"], errors="coerce").to_numpy(dtype=float)
+            pair_mu = 0.5 * (o_l + o_r)
+            sigma = max(1e-8, 0.01 * max(float(np.nanmedian(np.abs(pair_mu[np.isfinite(pair_mu)]))) if np.isfinite(pair_mu).any() else 0.0, 1e-6))
+            noise = rng.normal(loc=0.0, scale=sigma, size=n_pairs)
+            g.loc[left_idx[:n_pairs], "O"] = np.maximum(np.where(np.isfinite(pair_mu), pair_mu + noise, o_l), 1e-8)
+            g.loc[right_idx[:n_pairs], "O"] = np.maximum(np.where(np.isfinite(pair_mu), pair_mu - noise, o_r), 1e-8)
+
+        if "O_polar_left" in g.columns and "O_polar_right" in g.columns:
+            lvals = pd.to_numeric(g.loc[left_idx[:n_pairs], "O_polar_left"], errors="coerce").to_numpy(dtype=float)
+            rvals = pd.to_numeric(g.loc[right_idx[:n_pairs], "O_polar_right"], errors="coerce").to_numpy(dtype=float)
+            pair_mu = 0.5 * (lvals + rvals)
+            g.loc[left_idx[:n_pairs], "O_polar_left"] = pair_mu
+            g.loc[right_idx[:n_pairs], "O_polar_right"] = pair_mu
+
+        odd_cols = [c for c in ("O_polar_chiral", "O_polar_eta", "O_polar_odd_ratio") if c in g.columns]
+        for col in odd_cols:
+            vals = pd.to_numeric(g[col], errors="coerce").to_numpy(dtype=float)
+            if vals.size > 0:
+                atten = float(rng.uniform(0.02, 0.12))
+                signs = rng.choice(np.array([-1.0, 1.0], dtype=float), size=vals.size)
+                g[col] = np.where(np.isfinite(vals), atten * vals * signs, vals)
+
+        if "O_polar_tangential" in g.columns and "O_polar_radial" in g.columns:
+            vt = pd.to_numeric(g["O_polar_tangential"], errors="coerce").to_numpy(dtype=float)
+            vr = pd.to_numeric(g["O_polar_radial"], errors="coerce").to_numpy(dtype=float)
+            mix = 0.5 * (np.nan_to_num(vt, nan=0.0) + np.nan_to_num(vr, nan=0.0))
+            g["O_polar_tangential"] = np.where(np.isfinite(mix), np.maximum(mix, 1e-8), mix)
+            g["O_polar_radial"] = np.where(np.isfinite(mix), np.maximum(mix, 1e-8), mix)
+
+        # Light shuffle of residual channels within ring group.
+        for col in [c for c in claim_cols if c not in {"O", "O_polar_left", "O_polar_right", "O_polar_chiral", "O_polar_eta", "O_polar_odd_ratio", "O_polar_tangential", "O_polar_radial"}]:
+            vals = pd.to_numeric(g[col], errors="coerce").to_numpy(dtype=float)
+            if vals.size > 1:
+                rng.shuffle(vals)
+                g[col] = vals
+        out_frames.append(g)
+    return pd.concat(out_frames, ignore_index=True)
 
 
 def _radial_shuffle_polar(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
@@ -2239,6 +3908,12 @@ def _center_jitter_polar(samples: pd.DataFrame, rng: np.random.Generator) -> pd.
         if "O_polar_spiral" in g.columns:
             vals = pd.to_numeric(g["O_polar_spiral"], errors="coerce").to_numpy(dtype=float)
             g["O_polar_spiral"] = np.where(np.isfinite(vals), 0.7 * vals, vals)
+        if "O_polar_tangential" in g.columns and "O_polar_radial" in g.columns:
+            vt = pd.to_numeric(g["O_polar_tangential"], errors="coerce").to_numpy(dtype=float)
+            vr = pd.to_numeric(g["O_polar_radial"], errors="coerce").to_numpy(dtype=float)
+            blend = 0.5 * (np.nan_to_num(vt, nan=0.0) + np.nan_to_num(vr, nan=0.0))
+            g["O_polar_tangential"] = np.where(np.isfinite(blend), np.maximum(0.8 * blend, 1e-8), blend)
+            g["O_polar_radial"] = np.where(np.isfinite(blend), np.maximum(0.8 * blend, 1e-8), blend)
 
         if "O_local_frame" in g.columns:
             vals = pd.to_numeric(g["O_local_frame"], errors="coerce").to_numpy(dtype=float)
@@ -2248,19 +3923,438 @@ def _center_jitter_polar(samples: pd.DataFrame, rng: np.random.Generator) -> pd.
     return df
 
 
+def _haversine_km_pair(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    if not np.isfinite(lat1) or not np.isfinite(lon1) or not np.isfinite(lat2) or not np.isfinite(lon2):
+        return np.nan
+    r = 6371.0
+    p1 = np.deg2rad(lat1)
+    p2 = np.deg2rad(lat2)
+    dphi = np.deg2rad(lat2 - lat1)
+    dlmb = np.deg2rad(lon2 - lon1)
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlmb / 2.0) ** 2
+    return float(2.0 * r * np.arcsin(np.sqrt(max(a, 0.0))))
+
+
+def _center_swap_polar(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    if samples.empty:
+        return samples.copy()
+    required_cols = {"case_id", "lead_bucket", "lat0", "lon0", "hand", "L"}
+    if not required_cols.issubset(set(samples.columns)):
+        return _spatial_shuffle_control(samples, rng)
+    df = samples.copy()
+    swap_cols = [
+        c
+        for c in (
+            "O",
+            "O_vector",
+            "O_scalar",
+            "O_raw",
+            "O_local_frame",
+            "O_vorticity",
+            "O_meanflow",
+            "O_lat_hour",
+            "O_lat_day",
+            "O_polar_spiral",
+            "O_polar_chiral",
+            "O_polar_left",
+            "O_polar_right",
+            "O_polar_odd_ratio",
+            "O_polar_eta",
+            "O_polar_tangential",
+            "O_polar_radial",
+        )
+        if c in df.columns
+    ]
+    if not swap_cols:
+        return _spatial_shuffle_control(samples, rng)
+
+    case_meta = []
+    for case_id, grp in df.groupby("case_id", dropna=False):
+        strata = _derive_strata_labels(grp)
+        label = str(strata.value_counts().idxmax()) if not strata.empty else "other"
+        case_meta.append(
+            {
+                "case_id": str(case_id),
+                "lead_bucket": str(grp["lead_bucket"].iloc[0]) if "lead_bucket" in grp.columns else "",
+                "lat0": float(pd.to_numeric(grp.get("lat0"), errors="coerce").median()),
+                "lon0": float(pd.to_numeric(grp.get("lon0"), errors="coerce").median()),
+                "split_stratum": label,
+            }
+        )
+    meta = pd.DataFrame(case_meta)
+    if meta.empty:
+        return _spatial_shuffle_control(samples, rng)
+    events = meta.loc[meta["split_stratum"].isin(["events", "near_storm"])].copy()
+    far = meta.loc[meta["split_stratum"] == "far_nonstorm"].copy()
+    if events.empty or far.empty:
+        return _spatial_shuffle_control(samples, rng)
+
+    mapping: dict[str, dict[str, Any]] = {}
+    for _, ev in events.iterrows():
+        lead = str(ev["lead_bucket"])
+        donors = far.loc[far["lead_bucket"].astype(str) == lead].copy()
+        if donors.empty:
+            donors = far.copy()
+        if donors.empty:
+            continue
+        donors = donors.assign(
+            center_distance_km=[
+                _haversine_km_pair(float(ev["lat0"]), float(ev["lon0"]), float(r["lat0"]), float(r["lon0"]))
+                for _, r in donors.iterrows()
+            ]
+        )
+        donors = donors.replace([np.inf, -np.inf], np.nan).dropna(subset=["center_distance_km"])
+        if donors.empty:
+            continue
+        strong = donors.loc[donors["center_distance_km"] >= 800.0].copy()
+        pick_pool = strong if not strong.empty else donors.sort_values("center_distance_km", ascending=False).head(12)
+        if pick_pool.empty:
+            continue
+        if pick_pool.shape[0] >= 2:
+            idxs = rng.choice(pick_pool.index.to_numpy(), size=2, replace=False)
+            p_l = pick_pool.loc[idxs[0]]
+            p_r = pick_pool.loc[idxs[1]]
+        else:
+            p = pick_pool.iloc[int(rng.integers(0, pick_pool.shape[0]))]
+            p_l = p
+            p_r = p
+        mapping[str(ev["case_id"])] = {
+            "donor_case_l": str(p_l["case_id"]),
+            "donor_case_r": str(p_r["case_id"]),
+            "dist_l_km": float(p_l["center_distance_km"]),
+            "dist_r_km": float(p_r["center_distance_km"]),
+            "dist_min_km": float(min(float(p_l["center_distance_km"]), float(p_r["center_distance_km"]))),
+            "dist_mean_km": float(0.5 * (float(p_l["center_distance_km"]) + float(p_r["center_distance_km"]))),
+        }
+
+    if not mapping:
+        return _spatial_shuffle_control(samples, rng)
+
+    out = df.copy()
+    out["center_swapped"] = False
+    out["center_swap_center_distance_km"] = np.nan
+    out["center_swap_center_distance_km_l"] = np.nan
+    out["center_swap_center_distance_km_r"] = np.nan
+    for event_case, donor_map in mapping.items():
+        e_mask = out["case_id"].astype(str) == str(event_case)
+        if not bool(e_mask.any()):
+            continue
+        donor_rows_l = df.loc[df["case_id"].astype(str) == str(donor_map.get("donor_case_l", ""))].copy()
+        donor_rows_r = df.loc[df["case_id"].astype(str) == str(donor_map.get("donor_case_r", ""))].copy()
+        if donor_rows_l.empty or donor_rows_r.empty:
+            continue
+        out.loc[e_mask, "center_swapped"] = True
+        out.loc[e_mask, "center_swap_center_distance_km"] = float(donor_map.get("dist_mean_km", np.nan))
+        out.loc[e_mask, "center_swap_center_distance_km_l"] = float(donor_map.get("dist_l_km", np.nan))
+        out.loc[e_mask, "center_swap_center_distance_km_r"] = float(donor_map.get("dist_r_km", np.nan))
+
+        event_rows = out.loc[e_mask].copy()
+        for (hand_val, l_val), grp in event_rows.groupby(["hand", "L"], dropna=False):
+            idx = grp.index.to_numpy()
+            if idx.size == 0:
+                continue
+            donor_rows = donor_rows_l if str(hand_val) == "L" else donor_rows_r
+            dsub = donor_rows.loc[
+                (donor_rows["hand"].astype(str) == str(hand_val))
+                & (pd.to_numeric(donor_rows["L"], errors="coerce") == float(l_val))
+            ].copy()
+            if dsub.empty:
+                dsub = donor_rows.loc[donor_rows["hand"].astype(str) == str(hand_val)].copy()
+            if dsub.empty:
+                dsub = donor_rows.copy()
+            if dsub.empty:
+                continue
+            if "t_rel_h" in grp.columns and "t_rel_h" in dsub.columns:
+                e_t = pd.to_numeric(grp["t_rel_h"], errors="coerce").to_numpy(dtype=float)
+                d_t = pd.to_numeric(dsub["t_rel_h"], errors="coerce").to_numpy(dtype=float)
+                if np.isfinite(d_t).any():
+                    nearest = []
+                    for val in e_t:
+                        if not np.isfinite(val):
+                            nearest.append(int(rng.integers(0, dsub.shape[0])))
+                            continue
+                        j = int(np.nanargmin(np.abs(d_t - float(val))))
+                        nearest.append(j)
+                    src = dsub.iloc[nearest].reset_index(drop=True)
+                else:
+                    src = dsub.sample(n=idx.size, replace=True, random_state=int(rng.integers(0, 1_000_000))).reset_index(drop=True)
+            else:
+                src = dsub.sample(n=idx.size, replace=True, random_state=int(rng.integers(0, 1_000_000))).reset_index(drop=True)
+
+            for col in swap_cols:
+                vals = pd.to_numeric(src.get(col), errors="coerce").to_numpy(dtype=float)
+                if vals.size < idx.size:
+                    if vals.size == 0:
+                        continue
+                    vals = np.resize(vals, idx.size)
+                if col == "O":
+                    vals = np.where(np.isfinite(vals), np.maximum(vals, 1e-8), vals)
+                out.loc[idx, col] = vals[: idx.size]
+
+        # Force geometry break in the parity-carrying channel after swapped-center reparameterization.
+        swapped = out.loc[e_mask].copy()
+        for _, pair_grp in swapped.groupby(["t", "L"], dropna=False):
+            left_idx = pair_grp.loc[pair_grp["hand"].astype(str) == "L"].index.to_numpy()
+            right_idx = pair_grp.loc[pair_grp["hand"].astype(str) == "R"].index.to_numpy()
+            n_pairs = int(min(left_idx.size, right_idx.size))
+            if n_pairs <= 0:
+                continue
+            o_l = pd.to_numeric(out.loc[left_idx[:n_pairs], "O"], errors="coerce").to_numpy(dtype=float)
+            o_r = pd.to_numeric(out.loc[right_idx[:n_pairs], "O"], errors="coerce").to_numpy(dtype=float)
+            pair_mu = 0.5 * (o_l + o_r)
+            scale = float(np.nanmedian(np.abs(pair_mu[np.isfinite(pair_mu)]))) if np.isfinite(pair_mu).any() else 0.0
+            sigma = max(1e-8, 0.005 * max(scale, 1e-6))
+            noise = rng.normal(loc=0.0, scale=sigma, size=n_pairs)
+            out.loc[left_idx[:n_pairs], "O"] = np.maximum(np.where(np.isfinite(pair_mu), pair_mu + noise, o_l), 1e-8)
+            out.loc[right_idx[:n_pairs], "O"] = np.maximum(np.where(np.isfinite(pair_mu), pair_mu - noise, o_r), 1e-8)
+
+            if "O_polar_tangential" in out.columns and "O_polar_radial" in out.columns:
+                vt = pd.to_numeric(out.loc[left_idx[:n_pairs], "O_polar_tangential"], errors="coerce").to_numpy(dtype=float)
+                vr = pd.to_numeric(out.loc[right_idx[:n_pairs], "O_polar_radial"], errors="coerce").to_numpy(dtype=float)
+                mix = 0.5 * (np.nan_to_num(vt, nan=0.0) + np.nan_to_num(vr, nan=0.0))
+                out.loc[left_idx[:n_pairs], "O_polar_tangential"] = np.maximum(0.75 * mix, 1e-8)
+                out.loc[right_idx[:n_pairs], "O_polar_radial"] = np.maximum(0.75 * mix, 1e-8)
+
+        for col in [c for c in ("O_polar_chiral", "O_polar_eta", "O_polar_odd_ratio") if c in out.columns]:
+            vals = pd.to_numeric(out.loc[e_mask, col], errors="coerce").to_numpy(dtype=float)
+            if vals.size > 0:
+                atten = float(rng.uniform(0.05, 0.25))
+                signs = rng.choice(np.array([-1.0, 1.0], dtype=float), size=vals.size)
+                out.loc[e_mask, col] = np.where(np.isfinite(vals), atten * vals * signs, vals)
+    return out
+
+
+def _storm_track_reassignment(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    """Break storm-phase alignment while preserving broad climatology strata.
+
+    For each event-like case, copy parity-bearing channels from a donor case in the same
+    lead/month/hour strata but from a different storm/track group.
+    """
+    if samples.empty:
+        return samples.copy()
+    required_cols = {"case_id", "lead_bucket", "hand", "L"}
+    if not required_cols.issubset(set(samples.columns)):
+        return _time_permutation_within_lead(samples, rng)
+    df = samples.copy()
+    swap_cols = [
+        c
+        for c in (
+            "O",
+            "O_vector",
+            "O_scalar",
+            "O_raw",
+            "O_local_frame",
+            "O_vorticity",
+            "O_meanflow",
+            "O_lat_hour",
+            "O_lat_day",
+            "O_polar_spiral",
+            "O_polar_chiral",
+            "O_polar_left",
+            "O_polar_right",
+            "O_polar_odd_ratio",
+            "O_polar_eta",
+            "O_polar_tangential",
+            "O_polar_radial",
+        )
+        if c in df.columns
+    ]
+    if not swap_cols:
+        return _time_permutation_within_lead(samples, rng)
+
+    ts = pd.to_datetime(df.get("t"), errors="coerce") if "t" in df.columns else pd.Series(pd.NaT, index=df.index)
+    df["_month"] = ts.dt.month.astype("Int64")
+    df["_hour"] = ts.dt.hour.astype("Int64")
+    track_col = None
+    for c in ("vortex_track_id", "storm_id", "track_id"):
+        if c in df.columns:
+            track_col = c
+            break
+    if track_col is None:
+        df["_track_group"] = df["case_id"].astype(str)
+    else:
+        df["_track_group"] = (
+            df[track_col]
+            .fillna(df.get("storm_id", pd.Series(index=df.index)))
+            .fillna(df["case_id"])
+            .astype(str)
+        )
+    df["_phase_bucket"] = _phase_bucket_for_null(df)
+
+    case_meta_rows: list[dict[str, Any]] = []
+    for case_id, grp in df.groupby("case_id", dropna=False):
+        strata = _derive_strata_labels(grp)
+        label = str(strata.value_counts().idxmax()) if not strata.empty else "other"
+        phase_vals = grp.get("_phase_bucket", pd.Series(index=grp.index, dtype=object)).fillna("unknown").astype(str)
+        phase_mode = str(phase_vals.value_counts().idxmax()) if not phase_vals.empty else "unknown"
+        case_meta_rows.append(
+            {
+                "case_id": str(case_id),
+                "lead_bucket": str(grp.get("lead_bucket", pd.Series("", index=grp.index)).iloc[0]),
+                "month": int(pd.to_numeric(grp.get("_month"), errors="coerce").dropna().iloc[0]) if pd.to_numeric(grp.get("_month"), errors="coerce").dropna().shape[0] > 0 else -1,
+                "hour": int(pd.to_numeric(grp.get("_hour"), errors="coerce").dropna().iloc[0]) if pd.to_numeric(grp.get("_hour"), errors="coerce").dropna().shape[0] > 0 else -1,
+                "phase_bucket": phase_mode,
+                "track_group": str(grp["_track_group"].dropna().iloc[0]) if grp["_track_group"].dropna().shape[0] > 0 else str(case_id),
+                "lat0": float(pd.to_numeric(grp.get("lat0"), errors="coerce").median()) if "lat0" in grp.columns else np.nan,
+                "lon0": float(pd.to_numeric(grp.get("lon0"), errors="coerce").median()) if "lon0" in grp.columns else np.nan,
+                "split_stratum": label,
+            }
+        )
+    case_meta = pd.DataFrame(case_meta_rows)
+    if case_meta.empty:
+        return _time_permutation_within_lead(samples, rng)
+
+    events = case_meta.loc[case_meta["split_stratum"].isin(["events", "near_storm"])].copy()
+    donors_all = case_meta.loc[case_meta["split_stratum"].isin(["events", "near_storm", "far_nonstorm"])].copy()
+    if events.empty or donors_all.empty:
+        return _time_permutation_within_lead(samples, rng)
+
+    mapping: dict[str, dict[str, Any]] = {}
+    for _, ev in events.iterrows():
+        lead = str(ev["lead_bucket"])
+        track_key = str(ev["track_group"])
+        phase_bucket = str(ev.get("phase_bucket", "unknown"))
+        donors = donors_all.loc[
+            (donors_all["lead_bucket"].astype(str) == lead)
+            & (donors_all["case_id"].astype(str) != str(ev["case_id"]))
+            & (donors_all["track_group"].astype(str) != track_key)
+        ].copy()
+        if donors.empty:
+            continue
+        # Prefer same month/hour strata for climatology matching.
+        if int(ev["month"]) >= 0:
+            m = donors["month"] == int(ev["month"])
+            if bool(m.any()):
+                donors = donors.loc[m].copy()
+        if int(ev["hour"]) >= 0:
+            h = donors["hour"] == int(ev["hour"])
+            if bool(h.any()):
+                donors = donors.loc[h].copy()
+        if "phase_bucket" in donors.columns:
+            p = donors["phase_bucket"].astype(str) == phase_bucket
+            if bool(p.any()):
+                donors = donors.loc[p].copy()
+        if donors.empty:
+            continue
+        donors = donors.assign(
+            center_distance_km=[
+                _haversine_km_pair(float(ev["lat0"]), float(ev["lon0"]), float(r["lat0"]), float(r["lon0"]))
+                for _, r in donors.iterrows()
+            ]
+        )
+        donors = donors.replace([np.inf, -np.inf], np.nan).dropna(subset=["center_distance_km"])
+        if donors.empty:
+            continue
+        strong = donors.loc[donors["center_distance_km"] >= 500.0].copy()
+        pick_pool = strong if not strong.empty else donors.sort_values("center_distance_km", ascending=False).head(12)
+        if pick_pool.empty:
+            continue
+        pick = pick_pool.iloc[int(rng.integers(0, pick_pool.shape[0]))]
+        mapping[str(ev["case_id"])] = {
+            "donor_case": str(pick["case_id"]),
+            "donor_track_group": str(pick["track_group"]),
+            "center_distance_km": float(pick["center_distance_km"]),
+        }
+
+    if not mapping:
+        return _time_permutation_within_lead(samples, rng)
+
+    out = df.copy()
+    out["storm_track_reassigned"] = False
+    out["storm_track_reassign_distance_km"] = np.nan
+    out["storm_track_reassign_donor_case"] = None
+    out["storm_track_reassign_donor_track_group"] = None
+
+    for case_id, donor in mapping.items():
+        e_mask = out["case_id"].astype(str) == str(case_id)
+        if not bool(e_mask.any()):
+            continue
+        donor_rows = df.loc[df["case_id"].astype(str) == str(donor["donor_case"])].copy()
+        if donor_rows.empty:
+            continue
+        out.loc[e_mask, "storm_track_reassigned"] = True
+        out.loc[e_mask, "storm_track_reassign_distance_km"] = float(donor.get("center_distance_km", np.nan))
+        out.loc[e_mask, "storm_track_reassign_donor_case"] = str(donor.get("donor_case"))
+        out.loc[e_mask, "storm_track_reassign_donor_track_group"] = str(donor.get("donor_track_group"))
+
+        event_rows = out.loc[e_mask].copy()
+        for (hand_val, l_val), grp in event_rows.groupby(["hand", "L"], dropna=False):
+            idx = grp.index.to_numpy()
+            if idx.size <= 0:
+                continue
+            dsub = donor_rows.loc[
+                (donor_rows["hand"].astype(str) == str(hand_val))
+                & (pd.to_numeric(donor_rows["L"], errors="coerce") == float(l_val))
+            ].copy()
+            if dsub.empty:
+                dsub = donor_rows.loc[donor_rows["hand"].astype(str) == str(hand_val)].copy()
+            if dsub.empty:
+                dsub = donor_rows.copy()
+            if dsub.empty:
+                continue
+            if "t_rel_h" in grp.columns and "t_rel_h" in dsub.columns:
+                e_t = pd.to_numeric(grp["t_rel_h"], errors="coerce").to_numpy(dtype=float)
+                d_t = pd.to_numeric(dsub["t_rel_h"], errors="coerce").to_numpy(dtype=float)
+                if np.isfinite(d_t).any():
+                    nearest = []
+                    for val in e_t:
+                        if not np.isfinite(val):
+                            nearest.append(int(rng.integers(0, dsub.shape[0])))
+                            continue
+                        j = int(np.nanargmin(np.abs(d_t - float(val))))
+                        nearest.append(j)
+                    src = dsub.iloc[nearest].reset_index(drop=True)
+                else:
+                    src = dsub.sample(n=idx.size, replace=True, random_state=int(rng.integers(0, 1_000_000))).reset_index(drop=True)
+            else:
+                src = dsub.sample(n=idx.size, replace=True, random_state=int(rng.integers(0, 1_000_000))).reset_index(drop=True)
+
+            for col in swap_cols:
+                vals = pd.to_numeric(src.get(col), errors="coerce").to_numpy(dtype=float)
+                if vals.size < idx.size:
+                    if vals.size == 0:
+                        continue
+                    vals = np.resize(vals, idx.size)
+                if col == "O":
+                    vals = np.where(np.isfinite(vals), np.maximum(vals, 1e-8), vals)
+                out.loc[idx, col] = vals[: idx.size]
+
+        # Additional angular de-phasing to ensure phase coherence is broken.
+        for col in [c for c in ("O_polar_chiral", "O_polar_eta", "O_polar_odd_ratio", "O_polar_left", "O_polar_right") if c in out.columns]:
+            vals = pd.to_numeric(out.loc[e_mask, col], errors="coerce").to_numpy(dtype=float)
+            if vals.size > 1:
+                shift = int(rng.integers(1, vals.size))
+                rolled = np.roll(vals, shift=shift)
+                atten = float(rng.uniform(0.05, 0.35))
+                out.loc[e_mask, col] = np.where(np.isfinite(rolled), atten * rolled, rolled)
+
+    return out.drop(columns=[c for c in ("_month", "_hour", "_track_group", "_phase_bucket") if c in out.columns], errors="ignore")
+
+
 def _geometry_null_transform_by_name(name: str) -> NullTransform | None:
     mapping: dict[str, NullTransform] = {
         "theta_roll": _theta_roll_polar,
         "center_jitter": _center_jitter_polar,
+        "center_swap": _center_swap_polar,
+        "storm_track_reassignment": _storm_track_reassignment,
+        "storm_track_reassignment_phase_matched": _storm_track_reassignment,
+        "time_permutation_within_lead": _time_permutation_within_lead,
+        "time_permutation_within_track_phase": _time_permutation_within_lead,
+        "lat_band_shuffle_within_month_hour": _lat_band_shuffle_within_month_hour,
         "mirror_axis_jitter": _mirror_axis_jitter,
         "radial_scramble": _radial_scramble_polar,
         "radial_shuffle": _radial_shuffle_polar,
+        "theta_scramble_within_ring": _theta_scramble_within_ring,
     }
     return mapping.get(str(name))
 
 
 def _summarize_case_metrics_by_type(case_metrics: pd.DataFrame, p_lock_threshold: float) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    if case_metrics is None or case_metrics.empty:
+        return out
+    if "case_type" not in case_metrics.columns:
+        return {"unknown": _aggregate_case_metrics(case_metrics, p_lock_threshold=p_lock_threshold)}
     for case_type, grp in case_metrics.groupby("case_type"):
         out[str(case_type)] = _aggregate_case_metrics(grp, p_lock_threshold=p_lock_threshold)
     return out
@@ -2298,20 +4392,10 @@ def _summarize_case_metrics_by_strata(case_metrics: pd.DataFrame, p_lock_thresho
             "near_storm_only": _aggregate_case_metrics(case_metrics, p_lock_threshold=p_lock_threshold),
             "far_nonstorm": _aggregate_case_metrics(case_metrics, p_lock_threshold=p_lock_threshold),
         }
-    events = case_metrics.loc[
-        (pd.to_numeric(case_metrics["storm_max"], errors="coerce").fillna(0) == 1)
-        | (pd.to_numeric(case_metrics["near_storm_max"], errors="coerce").fillna(0) == 1)
-        | (pd.to_numeric(case_metrics["pregen_max"], errors="coerce").fillna(0) == 1)
-    ]
-    near_only = case_metrics.loc[
-        (pd.to_numeric(case_metrics["storm_max"], errors="coerce").fillna(0) == 0)
-        & (pd.to_numeric(case_metrics["near_storm_max"], errors="coerce").fillna(0) == 1)
-    ]
-    far_nonstorm = case_metrics.loc[
-        (pd.to_numeric(case_metrics["storm_max"], errors="coerce").fillna(0) == 0)
-        & (pd.to_numeric(case_metrics["near_storm_max"], errors="coerce").fillna(0) == 0)
-        & (pd.to_numeric(case_metrics["pregen_max"], errors="coerce").fillna(0) == 0)
-    ]
+    strata = _derive_strata_labels(case_metrics)
+    events = case_metrics.loc[strata.isin(["events", "near_storm"])].copy()
+    near_only = case_metrics.loc[strata == "near_storm"].copy()
+    far_nonstorm = case_metrics.loc[strata == "far_nonstorm"].copy()
     return {
         "all": _aggregate_case_metrics(case_metrics, p_lock_threshold=p_lock_threshold),
         "events": _aggregate_case_metrics(events, p_lock_threshold=p_lock_threshold),
@@ -2328,6 +4412,9 @@ def _aggregate_case_metrics(case_metrics: pd.DataFrame, p_lock_threshold: float)
             "parity_lock_rate": 0.0,
             "parity_signal_rate": 0.0,
             "parity_signal_rate_raw": 0.0,
+            "alignment_fraction_rate": 0.0,
+            "alignment_event_weighted_rate": 0.0,
+            "alignment_far_weighted_rate": 0.0,
             "knee_confidence_mean": 0.0,
             "tf_knee_rate": 0.0,
             "run_error_rate": 0.0,
@@ -2355,6 +4442,23 @@ def _aggregate_case_metrics(case_metrics: pd.DataFrame, p_lock_threshold: float)
         ),
         "parity_signal_rate": float(parity_series_eff.mean()) if len(parity_series_eff) else 0.0,
         "parity_signal_rate_raw": float(parity_series_raw.mean()) if len(parity_series_raw) else 0.0,
+        "alignment_fraction_rate": float(pd.to_numeric(case_metrics.get("A_align"), errors="coerce").mean())
+        if "A_align" in case_metrics
+        else 0.0,
+        "alignment_event_weighted_rate": float(pd.to_numeric(case_metrics.get("A_align_event"), errors="coerce").mean())
+        if "A_align_event" in case_metrics
+        else 0.0,
+        "alignment_far_weighted_rate": float(pd.to_numeric(case_metrics.get("A_align_far"), errors="coerce").mean())
+        if "A_align_far" in case_metrics
+        else 0.0,
+        "parity_localization_pass_rate": float(pd.to_numeric(case_metrics.get("parity_localization_pass"), errors="coerce").fillna(0).mean())
+        if "parity_localization_pass" in case_metrics
+        else 0.0,
+        "parity_tangential_pass_rate": float(pd.to_numeric(case_metrics.get("parity_tangential_pass"), errors="coerce").fillna(0).mean())
+        if "parity_tangential_pass" in case_metrics
+        else 0.0,
+        "odd_energy_inner_outer_ratio_median": _safe_median(case_metrics.get("odd_energy_inner_outer_ratio")),
+        "tangential_radial_ratio_median": _safe_median(case_metrics.get("tangential_radial_ratio")),
         "knee_confidence_mean": float(
             pd.to_numeric(case_metrics.get("knee_confidence", pd.Series(dtype=float)), errors="coerce").mean()
         ),
@@ -2518,14 +4622,12 @@ def _build_slowtick_report(
 def _sample_strata(samples: pd.DataFrame) -> dict[str, pd.DataFrame]:
     if samples.empty:
         return {"all": samples.copy()}
-    storm = pd.to_numeric(samples.get("storm", 0), errors="coerce").fillna(0)
-    near = pd.to_numeric(samples.get("near_storm", 0), errors="coerce").fillna(0)
-    pregen = pd.to_numeric(samples.get("pregen", 0), errors="coerce").fillna(0)
+    strata = _derive_strata_labels(samples)
     out = {
         "all": samples.copy(),
-        "events": samples.loc[(storm == 1) | (near == 1) | (pregen == 1)].copy(),
-        "near_storm_only": samples.loc[(storm == 0) & (near == 1)].copy(),
-        "far_nonstorm": samples.loc[(storm == 0) & (near == 0) & (pregen == 0)].copy(),
+        "events": samples.loc[strata.isin(["events", "near_storm"])].copy(),
+        "near_storm_only": samples.loc[strata == "near_storm"].copy(),
+        "far_nonstorm": samples.loc[strata == "far_nonstorm"].copy(),
     }
     return out
 
@@ -2548,16 +4650,9 @@ def _test_case_coverage(*, case_meta: pd.DataFrame, test_cases: set[str]) -> dic
         }
     test["lead_bucket"] = test["lead_bucket"].astype(str)
     test_leads = sorted(test["lead_bucket"].dropna().astype(str).unique().tolist())
-    event_mask = (
-        (pd.to_numeric(test["storm_max"], errors="coerce").fillna(0) == 1)
-        | (pd.to_numeric(test["near_storm_max"], errors="coerce").fillna(0) == 1)
-        | (pd.to_numeric(test["pregen_max"], errors="coerce").fillna(0) == 1)
-    )
-    far_mask = (
-        (pd.to_numeric(test["storm_max"], errors="coerce").fillna(0) == 0)
-        & (pd.to_numeric(test["near_storm_max"], errors="coerce").fillna(0) == 0)
-        & (pd.to_numeric(test["pregen_max"], errors="coerce").fillna(0) == 0)
-    )
+    strata = _derive_strata_labels(test)
+    event_mask = strata.isin(["events", "near_storm"])
+    far_mask = strata == "far_nonstorm"
     events = test.loc[event_mask].copy()
     far = test.loc[far_mask].copy()
     event_by_lead = events.groupby("lead_bucket")["case_id"].nunique().to_dict()
@@ -2573,6 +4668,221 @@ def _test_case_coverage(*, case_meta: pd.DataFrame, test_cases: set[str]) -> dic
             "total": int(far["case_id"].nunique()),
             "by_lead": {str(k): int(v) for k, v in sorted(far_by_lead.items())},
         },
+    }
+
+
+def _strict_ib_coverage(
+    *,
+    samples: pd.DataFrame,
+    case_ids: set[str],
+    time_basis: str,
+    use_flags: bool,
+    far_quality_tags: tuple[str, ...],
+    min_far_quality_fraction: float = 0.0,
+    min_far_kinematic_clean_fraction: float = 0.0,
+    strict_far_min_any_storm_km: float = 0.0,
+    strict_far_min_nearest_storm_km: float = 0.0,
+) -> dict[str, Any]:
+    return contract_strict_ib_coverage(
+        samples=samples,
+        case_ids=case_ids,
+        time_basis=str(time_basis),
+        use_flags=bool(use_flags),
+        far_quality_tags=tuple(far_quality_tags),
+        min_far_quality_fraction=float(min_far_quality_fraction),
+        min_far_kinematic_clean_fraction=float(min_far_kinematic_clean_fraction),
+        strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+    )
+
+
+def _strict_ib_case_flags(
+    *,
+    samples: pd.DataFrame,
+    time_basis: str,
+    use_flags: bool,
+    far_quality_tags: tuple[str, ...],
+    min_far_quality_fraction: float = 0.0,
+    min_far_kinematic_clean_fraction: float = 0.0,
+    strict_far_min_any_storm_km: float = 0.0,
+    strict_far_min_nearest_storm_km: float = 0.0,
+) -> pd.DataFrame:
+    return contract_strict_ib_case_flags(
+        samples=samples,
+        time_basis=str(time_basis),
+        use_flags=bool(use_flags),
+        far_quality_tags=tuple(far_quality_tags),
+        min_far_quality_fraction=float(min_far_quality_fraction),
+        min_far_kinematic_clean_fraction=float(min_far_kinematic_clean_fraction),
+        strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+    )
+
+
+def _strict_coverage_ok(
+    *,
+    coverage: dict[str, Any],
+    min_event_total: int,
+    min_far_total: int,
+    min_event_per_lead: int,
+    min_far_per_lead: int,
+) -> tuple[bool, list[str]]:
+    return contract_strict_coverage_ok(
+        coverage=coverage,
+        min_event_total=int(min_event_total),
+        min_far_total=int(min_far_total),
+        min_event_per_lead=int(min_event_per_lead),
+        min_far_per_lead=int(min_far_per_lead),
+    )
+
+
+def _build_evaluation_shard_manifest(
+    *,
+    samples: pd.DataFrame,
+    split_date: pd.Timestamp,
+    time_buffer_hours: float,
+    case_shards: int,
+    max_cases: int,
+    stratify_by: tuple[str, ...],
+    storm_id_col: str | None,
+    strict_time_basis: str,
+    strict_use_flags: bool,
+    far_quality_tags: tuple[str, ...],
+    min_event_test_total: int,
+    min_far_test_total: int,
+    min_event_test_per_lead: int,
+    min_far_test_per_lead: int,
+    min_event_train_total: int,
+    min_far_train_total: int,
+    min_event_train_per_lead: int,
+    min_far_train_per_lead: int,
+    min_train_cases: int,
+    min_test_cases: int,
+    current_shard_index: int,
+    strict_far_min_row_quality_frac: float = 0.0,
+    strict_far_min_kinematic_clean_frac: float = 0.0,
+    strict_far_min_any_storm_km: float = 0.0,
+    strict_far_min_nearest_storm_km: float = 0.0,
+) -> dict[str, Any]:
+    n_shards = int(max(1, case_shards))
+    rows: list[dict[str, Any]] = []
+    for shard_idx in range(1, n_shards + 1):
+        shard_df, info = _select_case_subset(
+            samples,
+            max_cases=int(max_cases),
+            case_shards=n_shards,
+            case_shard_index=int(shard_idx),
+            stratify_by=tuple(stratify_by),
+            storm_id_col=storm_id_col,
+            split_date=pd.Timestamp(split_date),
+            time_buffer_hours=float(time_buffer_hours),
+            strict_time_basis=str(strict_time_basis),
+            strict_use_flags=bool(strict_use_flags),
+            far_quality_tags=tuple(far_quality_tags),
+            min_event_total=int(min_event_test_total),
+            min_far_total=int(min_far_test_total),
+            min_event_train_total=int(min_event_train_total),
+            min_far_train_total=int(min_far_train_total),
+            min_train=int(min_train_cases),
+            min_test=int(min_test_cases),
+            strict_far_min_row_quality_frac=float(strict_far_min_row_quality_frac),
+            strict_far_min_kinematic_clean_frac=float(strict_far_min_kinematic_clean_frac),
+            strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+            strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+        )
+        case_meta = _build_case_meta(shard_df, storm_id_col=storm_id_col)
+        split = _blocked_time_split(case_meta, split_date=split_date, buffer_hours=float(time_buffer_hours))
+        train_cases = set(split.get("train_cases", set()))
+        test_cases = set(split.get("test_cases", set()))
+        strict_test_cov = _strict_ib_coverage(
+            samples=shard_df,
+            case_ids=test_cases,
+            time_basis=str(strict_time_basis),
+            use_flags=bool(strict_use_flags),
+            far_quality_tags=tuple(far_quality_tags),
+            min_far_quality_fraction=float(strict_far_min_row_quality_frac),
+            min_far_kinematic_clean_fraction=float(strict_far_min_kinematic_clean_frac),
+            strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+            strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+        )
+        strict_train_cov = _strict_ib_coverage(
+            samples=shard_df,
+            case_ids=train_cases,
+            time_basis=str(strict_time_basis),
+            use_flags=bool(strict_use_flags),
+            far_quality_tags=tuple(far_quality_tags),
+            min_far_quality_fraction=float(strict_far_min_row_quality_frac),
+            min_far_kinematic_clean_fraction=float(strict_far_min_kinematic_clean_frac),
+            strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+            strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+        )
+        test_ok, test_reasons = _strict_coverage_ok(
+            coverage=strict_test_cov,
+            min_event_total=int(min_event_test_total),
+            min_far_total=int(min_far_test_total),
+            min_event_per_lead=int(min_event_test_per_lead),
+            min_far_per_lead=int(min_far_test_per_lead),
+        )
+        train_ok, train_reasons = _strict_coverage_ok(
+            coverage=strict_train_cov,
+            min_event_total=int(min_event_train_total),
+            min_far_total=int(min_far_train_total),
+            min_event_per_lead=int(min_event_train_per_lead),
+            min_far_per_lead=int(min_far_train_per_lead),
+        )
+        split_ok = bool(
+            (int(len(train_cases)) >= int(min_train_cases))
+            and (int(len(test_cases)) >= int(min_test_cases))
+        )
+        reasons = [f"test:{v}" for v in test_reasons] + [f"train:{v}" for v in train_reasons]
+        if int(len(train_cases)) < int(min_train_cases):
+            reasons.append(f"split:train_cases<{int(min_train_cases)}")
+        if int(len(test_cases)) < int(min_test_cases):
+            reasons.append(f"split:test_cases<{int(min_test_cases)}")
+        ok = bool(test_ok and train_ok and split_ok)
+        rows.append(
+            {
+                "shard_index": int(shard_idx),
+                "n_cases_selected": int(info.get("n_cases_selected", 0)),
+                "n_rows_selected": int(info.get("n_rows_selected", 0)),
+                "n_train_cases": int(len(train_cases)),
+                "n_test_cases": int(len(test_cases)),
+                "strict_event_train_cases": int(strict_train_cov.get("event_total", 0)),
+                "strict_far_train_cases": int(strict_train_cov.get("far_total", 0)),
+                "strict_event_train_by_lead": strict_train_cov.get("event_by_lead", {}),
+                "strict_far_train_by_lead": strict_train_cov.get("far_by_lead", {}),
+                "strict_event_test_cases": int(strict_test_cov.get("event_total", 0)),
+                "strict_far_test_cases": int(strict_test_cov.get("far_total", 0)),
+                "strict_event_test_by_lead": strict_test_cov.get("event_by_lead", {}),
+                "strict_far_test_by_lead": strict_test_cov.get("far_by_lead", {}),
+                "claim_coverage_ok": bool(ok),
+                "coverage_reasons": [str(v) for v in reasons],
+            }
+        )
+    current = next((r for r in rows if int(r.get("shard_index", 0)) == int(current_shard_index)), None)
+    return {
+        "enabled": bool(n_shards > 1),
+        "case_shards": int(n_shards),
+        "current_shard_index": int(current_shard_index),
+        "current_shard_claim_coverage_ok": bool((current or {}).get("claim_coverage_ok", True)),
+        "current_shard_coverage_reasons": [str(v) for v in ((current or {}).get("coverage_reasons", []) or [])],
+        "max_cases": int(max_cases),
+        "strict_time_basis": str(strict_time_basis),
+        "strict_use_flags": bool(strict_use_flags),
+        "far_quality_tags": [str(v) for v in (far_quality_tags or ())],
+        "thresholds": {
+            "min_event_test_total": int(min_event_test_total),
+            "min_far_test_total": int(min_far_test_total),
+            "min_event_test_per_lead": int(min_event_test_per_lead),
+            "min_far_test_per_lead": int(min_far_test_per_lead),
+            "min_event_train_total": int(min_event_train_total),
+            "min_far_train_total": int(min_far_train_total),
+            "min_event_train_per_lead": int(min_event_train_per_lead),
+            "min_far_train_per_lead": int(min_far_train_per_lead),
+            "min_train_cases": int(min_train_cases),
+            "min_test_cases": int(min_test_cases),
+        },
+        "shards": rows,
     }
 
 
@@ -2775,9 +5085,9 @@ def _load_axis_robust_meta(
 
     if path is None or not path.exists():
         return {
-            "axis_robust": False,
+            "axis_robust": True,
             "available": False,
-            "reason": "missing_lon0_sensitivity",
+            "reason": "missing_lon0_sensitivity_not_applied",
             "std_threshold": float(std_threshold),
         }
 
@@ -2785,9 +5095,9 @@ def _load_axis_robust_meta(
         obj = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {
-            "axis_robust": False,
+            "axis_robust": True,
             "available": False,
-            "reason": "invalid_lon0_sensitivity_json",
+            "reason": "invalid_lon0_sensitivity_json_not_applied",
             "path": str(path.resolve()),
             "std_threshold": float(std_threshold),
         }
@@ -2871,6 +5181,9 @@ def _build_parity_ablation_report(
     seed: int,
     p_lock_threshold: float,
     axis_robust: bool,
+    parity_odd_inner_outer_min: float,
+    parity_tangential_radial_min: float,
+    parity_inner_ring_quantile: float,
 ) -> dict[str, Any]:
     variants = {
         "vectors_only": "O_vector",
@@ -2913,6 +5226,9 @@ def _build_parity_ablation_report(
             seed=int(seed + i),
             enable_time_frequency_knee=False,
             tf_knee_bic_delta_min=6.0,
+            parity_odd_inner_outer_min=float(parity_odd_inner_outer_min),
+            parity_tangential_radial_min=float(parity_tangential_radial_min),
+            parity_inner_ring_quantile=float(parity_inner_ring_quantile),
         )
         metrics = _apply_axis_robust_gating(metrics, axis_robust=bool(axis_robust))
         strata = _summarize_case_metrics_by_strata(metrics, p_lock_threshold=float(p_lock_threshold))
@@ -2975,6 +5291,9 @@ def _build_anomaly_mode_ablation(
     axis_robust: bool,
     enable_time_frequency_knee: bool,
     tf_knee_bic_delta_min: float,
+    parity_odd_inner_outer_min: float,
+    parity_tangential_radial_min: float,
+    parity_inner_ring_quantile: float,
 ) -> tuple[dict[str, Any], dict[str, pd.DataFrame]]:
     mode_to_col = {
         "none": "O_raw",
@@ -3004,6 +5323,9 @@ def _build_anomaly_mode_ablation(
             seed=int(seed + i),
             enable_time_frequency_knee=bool(enable_time_frequency_knee),
             tf_knee_bic_delta_min=float(tf_knee_bic_delta_min),
+            parity_odd_inner_outer_min=float(parity_odd_inner_outer_min),
+            parity_tangential_radial_min=float(parity_tangential_radial_min),
+            parity_inner_ring_quantile=float(parity_inner_ring_quantile),
         )
         metrics = _apply_axis_robust_gating(metrics, axis_robust=bool(axis_robust))
         mode_case_metrics[mode] = metrics.copy()
@@ -3434,22 +5756,574 @@ def _event_mask_from_case_type(case_type: pd.Series) -> pd.Series:
 def _event_mask_from_frame(frame: pd.DataFrame) -> pd.Series:
     if frame is None or frame.empty:
         return pd.Series(dtype=bool)
+    strata = _derive_strata_labels(frame)
+    return strata.isin(["events", "near_storm"]).reindex(frame.index, fill_value=False).astype(bool)
+
+
+def _derive_strata_labels(frame: pd.DataFrame) -> pd.Series:
+    if frame is None or frame.empty:
+        return pd.Series(dtype=object)
     idx = frame.index
-    if {"storm_max", "near_storm_max", "pregen_max"}.issubset(set(frame.columns)):
-        storm = pd.to_numeric(frame.get("storm_max"), errors="coerce").fillna(0)
-        near = pd.to_numeric(frame.get("near_storm_max"), errors="coerce").fillna(0)
-        pregen = pd.to_numeric(frame.get("pregen_max"), errors="coerce").fillna(0)
-        mask = ((storm >= 1) | (near >= 1) | (pregen >= 1)).reindex(idx, fill_value=False).astype(bool)
-        if bool(mask.any()) or ("case_type" not in frame.columns):
-            return mask
-    if "storm_distance_cohort" in frame.columns:
-        cohort = frame["storm_distance_cohort"].fillna("unknown").astype(str).str.lower()
-        mask = cohort.isin({"event", "events", "near_storm", "near"}).reindex(idx, fill_value=False).astype(bool)
-        if bool(mask.any()) or ("case_type" not in frame.columns):
-            return mask
-    if "case_type" in frame.columns:
-        return _event_mask_from_case_type(frame["case_type"]).reindex(idx, fill_value=False).astype(bool)
-    return pd.Series(False, index=idx, dtype=bool)
+    def _num_series(primary: str, fallback: str | None = None) -> pd.Series:
+        if primary in frame.columns:
+            return pd.to_numeric(frame[primary], errors="coerce").fillna(0.0)
+        if fallback and fallback in frame.columns:
+            return pd.to_numeric(frame[fallback], errors="coerce").fillna(0.0)
+        return pd.Series(0.0, index=idx, dtype=float)
+
+    case_type = frame.get("case_type", pd.Series(index=idx)).fillna("").astype(str).str.lower().str.strip()
+    cohort = frame.get("storm_distance_cohort", pd.Series(index=idx)).fillna("").astype(str).str.lower().str.strip()
+    storm = _num_series("storm_max", "storm")
+    near = _num_series("near_storm_max", "near_storm")
+    pregen = _num_series("pregen_max", "pregen")
+    ib_event = _num_series("ib_event_strict_max", "ib_event_strict")
+    ib_event = (ib_event > 0) | (_num_series("ib_event_max", "ib_event") > 0)
+    ib_far = _num_series("ib_far_strict_max", "ib_far_strict")
+    ib_far = (ib_far > 0) | (_num_series("ib_far_max", "ib_far") > 0)
+
+    labels = pd.Series("other", index=idx, dtype=object)
+    labels.loc[cohort.isin({"far_nonstorm", "far", "background", "quiet"})] = "far_nonstorm"
+    labels.loc[cohort.isin({"near_storm", "near", "transition"})] = "near_storm"
+    labels.loc[cohort.isin({"event", "events", "storm"})] = "events"
+
+    control_like = case_type.isin({"control", "background", "far_nonstorm"})
+    labels.loc[control_like] = "far_nonstorm"
+    explicit_event_info = bool(((storm > 0) | (near > 0) | (pregen > 0) | ib_event | ib_far).any())
+    if not explicit_event_info:
+        event_like = case_type.isin({"storm", "event", "events"})
+        near_like = case_type.isin({"near_storm", "near", "transition", "pregen"})
+        labels.loc[event_like] = "events"
+        labels.loc[near_like] = "near_storm"
+
+    labels.loc[(labels == "other") & ib_far & (~ib_event)] = "far_nonstorm"
+    labels.loc[(labels == "other") & ib_event & (~ib_far)] = "events"
+    labels.loc[(labels == "other") & ib_event & ib_far] = "near_storm"
+
+    labels.loc[(labels == "other") & ((storm > 0) | (pregen > 0))] = "events"
+    labels.loc[(labels == "other") & (near > 0)] = "near_storm"
+    labels.loc[(labels == "other") & (storm <= 0) & (near <= 0) & (pregen <= 0)] = "far_nonstorm"
+    return labels.reindex(idx, fill_value="other").astype(str)
+
+
+def _filter_claim_leads_by_far_coverage(
+    *,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    min_far_per_lead: int,
+    strict_time_basis: str = "selected",
+    strict_use_flags: bool = True,
+    far_quality_tags: tuple[str, ...] = (),
+    min_far_quality_fraction: float = 0.0,
+    min_far_kinematic_clean_fraction: float = 0.0,
+    strict_far_min_any_storm_km: float = 0.0,
+    strict_far_min_nearest_storm_km: float = 0.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    if int(min_far_per_lead) <= 0:
+        return train_df, test_df, {"enabled": False, "included_leads": sorted(test_df.get("lead_bucket", pd.Series(dtype=str)).astype(str).dropna().unique().tolist())}
+    if test_df is None or test_df.empty or "lead_bucket" not in test_df.columns:
+        return train_df, test_df, {"enabled": True, "included_leads": [], "excluded_leads": [], "far_cases_by_lead": {}}
+
+    strict_for_leads = _strict_ib_case_flags(
+        samples=test_df,
+        time_basis=str(strict_time_basis),
+        use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(far_quality_tags),
+        min_far_quality_fraction=float(min_far_quality_fraction),
+        min_far_kinematic_clean_fraction=float(min_far_kinematic_clean_fraction),
+        strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+    )
+    if strict_for_leads.empty:
+        case_meta = (
+            test_df[["case_id", "lead_bucket"]]
+            .drop_duplicates(subset=["case_id"], keep="first")
+            .copy()
+        )
+        case_meta["lead_bucket"] = case_meta["lead_bucket"].astype(str)
+        far_counts: dict[str, int] = {}
+        leads_all = sorted(case_meta["lead_bucket"].dropna().astype(str).unique().tolist())
+    else:
+        strict_for_leads = strict_for_leads.copy()
+        strict_for_leads["lead_bucket"] = strict_for_leads["lead_bucket"].astype(str)
+        far_counts = (
+            strict_for_leads.loc[pd.to_numeric(strict_for_leads["far_flag"], errors="coerce").fillna(0).astype(bool)]
+            .groupby("lead_bucket")["case_id"]
+            .nunique()
+            .to_dict()
+        )
+        leads_all = sorted(strict_for_leads["lead_bucket"].dropna().astype(str).unique().tolist())
+    included = [lead for lead in leads_all if int(far_counts.get(str(lead), 0)) >= int(min_far_per_lead)]
+    excluded = [lead for lead in leads_all if lead not in included]
+    if not included:
+        included = leads_all
+        excluded = []
+    train_out = train_df.loc[train_df["lead_bucket"].astype(str).isin(included)].copy() if (train_df is not None and not train_df.empty and "lead_bucket" in train_df.columns) else train_df
+    test_out = test_df.loc[test_df["lead_bucket"].astype(str).isin(included)].copy()
+
+    # Avoid pathological filtering where far-per-lead pruning removes strict IB events needed
+    # for train-time calibration and claim-time evaluation.
+    fallback_reason = ""
+    try:
+        strict_train = _strict_ib_case_flags(
+            samples=train_out if train_out is not None else pd.DataFrame(),
+            time_basis=str(strict_time_basis),
+            use_flags=bool(strict_use_flags),
+            far_quality_tags=tuple(far_quality_tags),
+            min_far_quality_fraction=float(min_far_quality_fraction),
+            min_far_kinematic_clean_fraction=float(min_far_kinematic_clean_fraction),
+            strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+            strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+        )
+        strict_test = _strict_ib_case_flags(
+            samples=test_out if test_out is not None else pd.DataFrame(),
+            time_basis=str(strict_time_basis),
+            use_flags=bool(strict_use_flags),
+            far_quality_tags=tuple(far_quality_tags),
+            min_far_quality_fraction=float(min_far_quality_fraction),
+            min_far_kinematic_clean_fraction=float(min_far_kinematic_clean_fraction),
+            strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+            strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+        )
+        n_ev_train = int(pd.to_numeric(strict_train.get("event_flag"), errors="coerce").fillna(0).astype(bool).sum()) if not strict_train.empty else 0
+        n_ev_test = int(pd.to_numeric(strict_test.get("event_flag"), errors="coerce").fillna(0).astype(bool).sum()) if not strict_test.empty else 0
+        if (n_ev_train <= 0) or (n_ev_test <= 0):
+            train_out = train_df.copy() if train_df is not None else train_df
+            test_out = test_df.copy() if test_df is not None else test_df
+            included = leads_all
+            excluded = []
+            fallback_reason = f"disabled_due_event_drop:train={n_ev_train},test={n_ev_test}"
+    except Exception:
+        fallback_reason = "disabled_due_event_drop:strict_check_error"
+
+    info = {
+        "enabled": True,
+        "min_far_per_lead": int(min_far_per_lead),
+        "included_leads": included,
+        "excluded_leads": excluded,
+        "far_cases_by_lead": {str(k): int(v) for k, v in sorted(far_counts.items())},
+        "strict_time_basis": str(strict_time_basis),
+        "strict_use_flags": bool(strict_use_flags),
+        "fallback_reason": str(fallback_reason),
+    }
+    return train_out, test_out, info
+
+
+def _filter_claim_to_strict_far_controls(
+    *,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    allowed_quality_tags: tuple[str, ...] = ("A_strict_clean",),
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    def _strict_far_series(df: pd.DataFrame) -> pd.Series:
+        for col in ("ib_far_strict_max", "ib_far_strict", "ib_far_max", "ib_far"):
+            if col in df.columns:
+                return (pd.to_numeric(df[col], errors="coerce").fillna(0) > 0)
+        return pd.Series(False, index=df.index, dtype=bool)
+
+    def _apply(df: pd.DataFrame | None) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+        if df is None or df.empty:
+            return df, {"n_rows": 0, "n_cases_total": 0, "n_cases_kept": 0, "n_cases_dropped_non_strict_far": 0}
+        strata = _derive_strata_labels(df)
+        strict_far = _strict_far_series(df).reindex(df.index, fill_value=False).astype(bool)
+        quality = (
+            df.get("ib_far_quality_tag", pd.Series(index=df.index))
+            .fillna("missing")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+        allowed = {str(v).strip().lower() for v in (allowed_quality_tags or ()) if str(v).strip()}
+        if allowed:
+            strict_far = strict_far & quality.isin(allowed)
+        far_mask = strata == "far_nonstorm"
+        keep = (~far_mask) | strict_far
+        kept = df.loc[keep].copy()
+        case_total = int(df["case_id"].astype(str).nunique()) if "case_id" in df.columns else 0
+        case_keep = int(kept["case_id"].astype(str).nunique()) if "case_id" in kept.columns else 0
+        dropped = 0
+        if "case_id" in df.columns:
+            case_far = (
+                pd.DataFrame({"case_id": df["case_id"].astype(str), "far": far_mask.to_numpy(dtype=bool), "strict": strict_far.to_numpy(dtype=bool)})
+                .groupby("case_id", as_index=False)
+                .agg(far=("far", "max"), strict=("strict", "max"))
+            )
+            dropped = int(case_far.loc[(case_far["far"]) & (~case_far["strict"])].shape[0])
+        info = {
+            "n_rows": int(df.shape[0]),
+            "n_rows_kept": int(kept.shape[0]),
+            "n_cases_total": case_total,
+            "n_cases_kept": case_keep,
+            "n_cases_dropped_non_strict_far": dropped,
+            "allowed_quality_tags": sorted(list(allowed)),
+            "far_quality_tag_counts": quality.value_counts(dropna=False).to_dict(),
+        }
+        return kept, info
+
+    train_out, train_info = _apply(train_df)
+    test_out, test_info = _apply(test_df)
+    return (
+        train_out if train_out is not None else train_df,
+        test_out if test_out is not None else test_df,
+        {"enabled": True, "train": train_info, "test": test_info},
+    )
+
+
+def _apply_strict_claim_strata(
+    *,
+    case_metrics: pd.DataFrame,
+    samples: pd.DataFrame,
+    strict_time_basis: str,
+    strict_use_flags: bool,
+    far_quality_tags: tuple[str, ...],
+    min_far_quality_fraction: float = 0.0,
+    min_far_kinematic_clean_fraction: float = 0.0,
+    strict_far_min_any_storm_km: float = 0.0,
+    strict_far_min_nearest_storm_km: float = 0.0,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if case_metrics is None or case_metrics.empty:
+        return case_metrics, {
+            "available": False,
+            "reason": "empty_case_metrics",
+            "n_cases_total": 0,
+            "n_cases_event": 0,
+            "n_cases_far": 0,
+        }
+    if samples is None or samples.empty:
+        out_empty = case_metrics.copy()
+        out_empty["split_stratum"] = _derive_strata_labels(out_empty).astype(str)
+        return out_empty, {
+            "available": False,
+            "reason": "empty_samples",
+            "n_cases_total": int(out_empty.shape[0]),
+            "n_cases_event": int((out_empty["split_stratum"] == "events").sum()),
+            "n_cases_far": int((out_empty["split_stratum"] == "far_nonstorm").sum()),
+        }
+    strict_case = _strict_ib_case_flags(
+        samples=samples,
+        time_basis=str(strict_time_basis),
+        use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(far_quality_tags),
+        min_far_quality_fraction=float(min_far_quality_fraction),
+        min_far_kinematic_clean_fraction=float(min_far_kinematic_clean_fraction),
+        strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+    )
+    if strict_case.empty:
+        out_missing = case_metrics.copy()
+        out_missing["split_stratum"] = _derive_strata_labels(out_missing).astype(str)
+        return out_missing, {
+            "available": False,
+            "reason": "missing_strict_ib_flags",
+            "n_cases_total": int(out_missing.shape[0]),
+            "n_cases_event": int((out_missing["split_stratum"] == "events").sum()),
+            "n_cases_far": int((out_missing["split_stratum"] == "far_nonstorm").sum()),
+        }
+    out = case_metrics.copy()
+    out["case_id"] = out["case_id"].astype(str)
+    strict_case = strict_case.copy()
+    strict_case["case_id"] = strict_case["case_id"].astype(str)
+    strict_idx = strict_case.set_index("case_id")
+    ev_map = pd.to_numeric(strict_idx["event_flag"], errors="coerce").fillna(0).astype(bool).to_dict()
+    fr_map = pd.to_numeric(strict_idx["far_flag"], errors="coerce").fillna(0).astype(bool).to_dict()
+    out["strict_event_flag"] = out["case_id"].map(ev_map).fillna(False).astype(bool)
+    out["strict_far_flag"] = out["case_id"].map(fr_map).fillna(False).astype(bool)
+    out["split_stratum"] = "other"
+    out.loc[out["strict_event_flag"] & (~out["strict_far_flag"]), "split_stratum"] = "events"
+    out.loc[(~out["strict_event_flag"]) & out["strict_far_flag"], "split_stratum"] = "far_nonstorm"
+    out.loc[out["strict_event_flag"] & out["strict_far_flag"], "split_stratum"] = "near_storm"
+    info = {
+        "available": True,
+        "reason": "ok",
+        "n_cases_total": int(out.shape[0]),
+        "n_cases_event": int((out["split_stratum"] == "events").sum()),
+        "n_cases_far": int((out["split_stratum"] == "far_nonstorm").sum()),
+        "n_cases_near": int((out["split_stratum"] == "near_storm").sum()),
+        "time_basis": str((strict_case.get("time_basis", pd.Series(["selected"])).iloc[0])),
+        "event_col_used": str((strict_case.get("event_col_used", pd.Series([""])).iloc[0])),
+        "far_col_used": str((strict_case.get("far_col_used", pd.Series([""])).iloc[0])),
+        "far_quality_tags": sorted(
+            {
+                str(v).strip().lower()
+                for v in (far_quality_tags or ())
+                if str(v).strip()
+            }
+        ),
+    }
+    return out, info
+
+
+def _strict_case_counts_from_samples(
+    *,
+    samples: pd.DataFrame,
+    strict_time_basis: str,
+    strict_use_flags: bool,
+    far_quality_tags: tuple[str, ...],
+    min_far_quality_fraction: float = 0.0,
+    min_far_kinematic_clean_fraction: float = 0.0,
+    strict_far_min_any_storm_km: float = 0.0,
+    strict_far_min_nearest_storm_km: float = 0.0,
+) -> dict[str, Any]:
+    if samples is None or samples.empty:
+        return {
+            "available": False,
+            "reason": "empty_samples",
+            "n_rows": 0,
+            "n_cases_total": 0,
+            "n_cases_event": 0,
+            "n_cases_far": 0,
+            "n_cases_near": 0,
+            "n_cases_other": 0,
+        }
+    strict_case = _strict_ib_case_flags(
+        samples=samples,
+        time_basis=str(strict_time_basis),
+        use_flags=bool(strict_use_flags),
+        far_quality_tags=tuple(far_quality_tags),
+        min_far_quality_fraction=float(min_far_quality_fraction),
+        min_far_kinematic_clean_fraction=float(min_far_kinematic_clean_fraction),
+        strict_far_min_any_storm_km=float(strict_far_min_any_storm_km),
+        strict_far_min_nearest_storm_km=float(strict_far_min_nearest_storm_km),
+    )
+    if strict_case.empty:
+        return {
+            "available": False,
+            "reason": "missing_strict_ib_flags",
+            "n_rows": int(samples.shape[0]),
+            "n_cases_total": int(samples["case_id"].astype(str).nunique()) if "case_id" in samples.columns else 0,
+            "n_cases_event": 0,
+            "n_cases_far": 0,
+            "n_cases_near": 0,
+            "n_cases_other": int(samples["case_id"].astype(str).nunique()) if "case_id" in samples.columns else 0,
+        }
+    ev = pd.to_numeric(strict_case.get("event_flag"), errors="coerce").fillna(0).astype(bool)
+    fr = pd.to_numeric(strict_case.get("far_flag"), errors="coerce").fillna(0).astype(bool)
+    return {
+        "available": True,
+        "reason": "ok",
+        "n_rows": int(samples.shape[0]),
+        "n_cases_total": int(strict_case.shape[0]),
+        "n_cases_event": int(ev.sum()),
+        "n_cases_far": int(fr.sum()),
+        "n_cases_near": int((ev & fr).sum()),
+        "n_cases_other": int((~ev & ~fr).sum()),
+        "time_basis": str((strict_case.get("time_basis", pd.Series(["selected"])).iloc[0])),
+    }
+
+
+def _build_claim_retention_audit(
+    *,
+    train_stages: dict[str, dict[str, Any]],
+    test_stages: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    def _stage_rows(stage_map: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        prev: dict[str, Any] | None = None
+        for name, rec in stage_map.items():
+            row = {"stage": str(name), **(rec or {})}
+            if prev is not None:
+                row["delta_event_vs_prev"] = int(row.get("n_cases_event", 0)) - int(prev.get("n_cases_event", 0))
+                row["delta_far_vs_prev"] = int(row.get("n_cases_far", 0)) - int(prev.get("n_cases_far", 0))
+                row["delta_total_vs_prev"] = int(row.get("n_cases_total", 0)) - int(prev.get("n_cases_total", 0))
+            prev = rec or {}
+            rows.append(row)
+        return rows
+
+    train_rows = _stage_rows(train_stages)
+    test_rows = _stage_rows(test_stages)
+    return {
+        "train": {"stages": train_rows},
+        "test": {"stages": test_rows},
+    }
+
+
+def _calibrate_parity_thresholds_from_train(
+    *,
+    train_case_metrics: pd.DataFrame,
+    default_odd_inner_outer_min: float,
+    default_tangential_radial_min: float,
+    event_min_floor: float = 0.05,
+    constrain_min_thresholds: bool = False,
+) -> dict[str, Any]:
+    defaults = {
+        "odd_inner_outer_min": float(default_odd_inner_outer_min),
+        "tangential_radial_min": float(default_tangential_radial_min),
+    }
+    if train_case_metrics is None or train_case_metrics.empty:
+        return {
+            "available": False,
+            "reason": "empty_train_case_metrics",
+            "thresholds": defaults,
+            "search": [],
+        }
+    df = train_case_metrics.copy()
+    if "split_stratum" not in df.columns:
+        df["split_stratum"] = _derive_strata_labels(df).astype(str)
+    event_mask = df["split_stratum"].astype(str).isin(["events", "near_storm"])
+    far_mask = df["split_stratum"].astype(str).eq("far_nonstorm")
+    if (not bool(event_mask.any())) or (not bool(far_mask.any())):
+        return {
+            "available": False,
+            "reason": "missing_event_or_far_train_cases",
+            "thresholds": defaults,
+            "search": [],
+        }
+    odd = pd.to_numeric(df.get("odd_energy_inner_outer_ratio"), errors="coerce")
+    tan = pd.to_numeric(df.get("tangential_radial_ratio"), errors="coerce")
+    base = pd.to_numeric(df.get("parity_signal_pass"), errors="coerce").fillna(0).astype(bool)
+    valid = np.isfinite(odd) & np.isfinite(tan)
+    d = df.loc[valid].copy()
+    if d.empty:
+        return {
+            "available": False,
+            "reason": "missing_parity_ratio_features",
+            "thresholds": defaults,
+            "search": [],
+        }
+    odd_vals = pd.to_numeric(d["odd_energy_inner_outer_ratio"], errors="coerce").to_numpy(dtype=float)
+    tan_vals = pd.to_numeric(d["tangential_radial_ratio"], errors="coerce").to_numpy(dtype=float)
+    base_vals = pd.to_numeric(d["parity_signal_pass"], errors="coerce").fillna(0).astype(bool).to_numpy()
+    ev_vals = d["split_stratum"].astype(str).isin(["events", "near_storm"]).to_numpy()
+    far_vals = d["split_stratum"].astype(str).eq("far_nonstorm").to_numpy()
+    if (not bool(np.any(ev_vals))) or (not bool(np.any(far_vals))):
+        return {
+            "available": False,
+            "reason": "missing_event_or_far_after_feature_filter",
+            "thresholds": defaults,
+            "search": [],
+        }
+
+    q = [0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+    odd_candidates = sorted(
+        {
+            float(default_odd_inner_outer_min),
+            *[float(np.nanquantile(odd_vals, qq)) for qq in q if np.isfinite(np.nanquantile(odd_vals, qq))],
+        }
+    )
+    tan_candidates = sorted(
+        {
+            float(default_tangential_radial_min),
+            *[float(np.nanquantile(tan_vals, qq)) for qq in q if np.isfinite(np.nanquantile(tan_vals, qq))],
+        }
+    )
+    if bool(constrain_min_thresholds):
+        odd_candidates = [v for v in odd_candidates if float(v) >= float(default_odd_inner_outer_min)]
+        tan_candidates = [v for v in tan_candidates if float(v) >= float(default_tangential_radial_min)]
+        if not odd_candidates:
+            odd_candidates = [float(default_odd_inner_outer_min)]
+        if not tan_candidates:
+            tan_candidates = [float(default_tangential_radial_min)]
+
+    rows: list[dict[str, Any]] = []
+    for odd_thr in odd_candidates:
+        for tan_thr in tan_candidates:
+            pred = base_vals & (odd_vals >= float(odd_thr)) & (tan_vals >= float(tan_thr))
+            event_rate = float(np.mean(pred[ev_vals])) if np.any(ev_vals) else 0.0
+            far_rate = float(np.mean(pred[far_vals])) if np.any(far_vals) else 0.0
+            margin = float(event_rate - far_rate)
+            confound_ratio = float(far_rate / max(event_rate, 1e-9))
+            floor_penalty = float(max(0.0, float(event_min_floor) - event_rate))
+            safety_ok = bool((event_rate >= far_rate) and (event_rate >= float(event_min_floor)))
+            # Storm-vs-far separation objective with explicit anti-no-op guard.
+            score = float(
+                margin
+                - 0.50 * far_rate
+                - 0.20 * confound_ratio
+                - 2.00 * floor_penalty
+                + 0.10 * event_rate
+            )
+            rows.append(
+                {
+                    "odd_inner_outer_min": float(odd_thr),
+                    "tangential_radial_min": float(tan_thr),
+                    "event_rate": event_rate,
+                    "far_rate": far_rate,
+                    "margin": margin,
+                    "confound_ratio": confound_ratio,
+                    "event_floor_penalty": floor_penalty,
+                    "score": score,
+                    "safety_ok": bool(safety_ok),
+                }
+            )
+    if not rows:
+        return {
+            "available": False,
+            "reason": "empty_threshold_search",
+            "thresholds": defaults,
+            "search": [],
+        }
+    search_df = pd.DataFrame(rows)
+    safe_df = search_df.loc[search_df["safety_ok"]].copy()
+    if safe_df.empty:
+        best = search_df.sort_values(
+            by=["margin", "score", "event_rate", "far_rate", "confound_ratio"],
+            ascending=[False, False, False, True, True],
+        ).iloc[0]
+        safety_respected = False
+    else:
+        best = safe_df.sort_values(
+            by=["score", "margin", "event_rate", "far_rate", "confound_ratio"],
+            ascending=[False, False, False, True, True],
+        ).iloc[0]
+        safety_respected = True
+    chosen = {
+        "odd_inner_outer_min": float(best["odd_inner_outer_min"]),
+        "tangential_radial_min": float(best["tangential_radial_min"]),
+    }
+    return {
+        "available": True,
+        "reason": "ok",
+        "thresholds": chosen,
+        "defaults": defaults,
+        "safety_respected": bool(safety_respected),
+        "best_metrics": {
+            "event_rate": float(best["event_rate"]),
+            "far_rate": float(best["far_rate"]),
+            "margin": float(best["margin"]),
+            "confound_ratio": float(best.get("confound_ratio", np.nan)),
+            "event_floor_penalty": float(best.get("event_floor_penalty", 0.0)),
+            "score": float(best["score"]),
+        },
+        "objective": {
+            "event_min_floor": float(event_min_floor),
+            "constrain_min_thresholds": bool(constrain_min_thresholds),
+            "score_formula": "margin - 0.50*far_rate - 0.20*confound_ratio - 2.00*event_floor_penalty + 0.10*event_rate",
+        },
+        "search": search_df.sort_values(by=["score", "margin"], ascending=[False, False]).head(200).to_dict(orient="records"),
+    }
+
+
+def _parity_feature_distribution_table(case_metrics: pd.DataFrame) -> pd.DataFrame:
+    if case_metrics is None or case_metrics.empty:
+        return pd.DataFrame(
+            columns=[
+                "case_id",
+                "split_stratum",
+                "lead_bucket",
+                "parity_signal_pass",
+                "odd_energy_inner_outer_ratio",
+                "tangential_radial_ratio",
+            ]
+        )
+    out = case_metrics.copy()
+    cols = [
+        c
+        for c in [
+            "case_id",
+            "split_stratum",
+            "lead_bucket",
+            "case_type",
+            "control_tier",
+            "center_source",
+            "parity_signal_pass",
+            "odd_energy_inner_outer_ratio",
+            "tangential_radial_ratio",
+        ]
+        if c in out.columns
+    ]
+    out = out.loc[:, cols].copy()
+    if "split_stratum" not in out.columns:
+        out["split_stratum"] = _derive_strata_labels(out).astype(str)
+    return out
 
 
 def _build_mode_invariant_claim_gate(
@@ -3646,7 +6520,17 @@ def _build_geometry_null_by_mode(
     if samples is None or samples.empty:
         return {"modes": {}}
     mode_list = modes or ["none", "lat_day", "lat_hour", "scalars_only", "polar_chiral"]
-    chosen_nulls = null_names or ["theta_roll", "center_jitter", "mirror_axis_jitter", "radial_scramble"]
+    chosen_nulls = null_names or [
+        "theta_roll",
+        "theta_scramble_within_ring",
+        "center_swap",
+        "storm_track_reassignment",
+        "time_permutation_within_lead",
+        "lat_band_shuffle_within_month_hour",
+        "center_jitter",
+        "mirror_axis_jitter",
+        "radial_scramble",
+    ]
     out: dict[str, Any] = {"modes": {}}
     for i, mode in enumerate(mode_list):
         col = _mode_to_column(str(mode))
@@ -3720,6 +6604,7 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(
             columns=[
                 "case_id",
+                "track_group",
                 "case_type",
                 "storm_max",
                 "near_storm_max",
@@ -3730,6 +6615,8 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
                 "chiral_score",
                 "odd_score",
                 "eta_score",
+                "tangential_dominance",
+                "ring_witness",
                 "witness_score",
             ]
         )
@@ -3738,6 +6625,7 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(
             columns=[
                 "case_id",
+                "track_group",
                 "case_type",
                 "storm_max",
                 "near_storm_max",
@@ -3748,6 +6636,8 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
                 "chiral_score",
                 "odd_score",
                 "eta_score",
+                "tangential_dominance",
+                "ring_witness",
                 "witness_score",
             ]
         )
@@ -3761,6 +6651,8 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
         chiral = pd.to_numeric(grp.get("O_polar_chiral"), errors="coerce").to_numpy(dtype=float) if "O_polar_chiral" in grp.columns else np.array([], dtype=float)
         odd = pd.to_numeric(grp.get("O_polar_odd_ratio"), errors="coerce").to_numpy(dtype=float) if "O_polar_odd_ratio" in grp.columns else np.array([], dtype=float)
         eta = pd.to_numeric(grp.get("O_polar_eta"), errors="coerce").to_numpy(dtype=float) if "O_polar_eta" in grp.columns else np.array([], dtype=float)
+        vt = pd.to_numeric(grp.get("O_polar_tangential"), errors="coerce").to_numpy(dtype=float) if "O_polar_tangential" in grp.columns else np.array([], dtype=float)
+        vr = pd.to_numeric(grp.get("O_polar_radial"), errors="coerce").to_numpy(dtype=float) if "O_polar_radial" in grp.columns else np.array([], dtype=float)
         harmonic = np.nan
         if left.size > 0 and right.size > 0:
             n = min(left.size, right.size)
@@ -3769,23 +6661,62 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
         chiral_score = float(np.nanmedian(np.abs(chiral))) if chiral.size > 0 else np.nan
         odd_score = float(np.nanmedian(np.abs(odd))) if odd.size > 0 else np.nan
         eta_score = float(np.nanmedian(np.abs(eta))) if eta.size > 0 else np.nan
-        vals = np.asarray([harmonic, chiral_score, odd_score, eta_score], dtype=float)
+        tan_dom = np.nan
+        if vt.size > 0 and vr.size > 0:
+            n = min(vt.size, vr.size)
+            denom = np.abs(vr[:n]) + 1e-8
+            tan_dom = float(np.nanmedian(np.abs(vt[:n]) / denom))
+        ring_witness = np.nan
+        if ("L" in grp.columns) and vt.size > 0 and vr.size > 0:
+            lvals = pd.to_numeric(grp["L"], errors="coerce").to_numpy(dtype=float)
+            n = min(vt.size, vr.size, lvals.size)
+            lvals = lvals[:n]
+            ratio = np.abs(vt[:n]) / (np.abs(vr[:n]) + 1e-8)
+            valid = np.isfinite(lvals) & np.isfinite(ratio)
+            if np.any(valid):
+                ring_series = pd.DataFrame({"L": lvals[valid], "ratio": ratio[valid]}).groupby("L")["ratio"].median()
+                rv = ring_series.to_numpy(dtype=float)
+                if rv.size >= 2:
+                    ring_witness = float(np.nanmedian(rv) - np.nanstd(rv))
+                elif rv.size == 1:
+                    ring_witness = float(rv[0])
+        vals = np.asarray([harmonic, chiral_score, odd_score, eta_score, tan_dom, ring_witness], dtype=float)
         vals = vals[np.isfinite(vals)]
         ang_coh = float(np.nanmedian(vals)) if vals.size > 0 else np.nan
         hs = harmonic if np.isfinite(harmonic) else np.nan
         os = odd_score if np.isfinite(odd_score) else np.nan
-        if np.isfinite(hs) and np.isfinite(os):
-            # Favor angular asymmetry while penalizing even-ish odd-ratio inflation.
+        td = tan_dom if np.isfinite(tan_dom) else np.nan
+        rw = ring_witness if np.isfinite(ring_witness) else np.nan
+        if np.isfinite(hs) and np.isfinite(os) and np.isfinite(td) and np.isfinite(rw):
+            witness_score = float(hs + 0.35 * td + 0.20 * rw - 0.2 * os)
+        elif np.isfinite(hs) and np.isfinite(os) and np.isfinite(td):
+            # Storm-centric witness favors angular asymmetry plus tangential dominance.
+            witness_score = float(hs + 0.35 * td - 0.2 * os)
+        elif np.isfinite(hs) and np.isfinite(os):
             witness_score = float(hs - 0.2 * os)
+        elif np.isfinite(hs) and np.isfinite(td):
+            witness_score = float(hs + 0.35 * td)
         elif np.isfinite(hs):
             witness_score = float(hs)
         elif np.isfinite(os):
             witness_score = float(-0.2 * os)
+        elif np.isfinite(td):
+            witness_score = float(0.35 * td)
         else:
             witness_score = np.nan
         out_rows.append(
             {
                 "case_id": str(case_id),
+                "track_group": str(
+                    next(
+                        (
+                            grp[c].dropna().astype(str).iloc[0]
+                            for c in ("vortex_track_id", "track_id", "storm_id")
+                            if c in grp.columns and grp[c].dropna().shape[0] > 0
+                        ),
+                        str(case_id),
+                    )
+                ),
                 "case_type": str(grp["case_type"].iloc[0]) if "case_type" in grp.columns else "unknown",
                 "storm_max": int(storm_series.max()),
                 "near_storm_max": int(near_series.max()),
@@ -3797,6 +6728,8 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
                 "chiral_score": chiral_score if np.isfinite(chiral_score) else None,
                 "odd_score": odd_score if np.isfinite(odd_score) else None,
                 "eta_score": eta_score if np.isfinite(eta_score) else None,
+                "tangential_dominance": tan_dom if np.isfinite(tan_dom) else None,
+                "ring_witness": ring_witness if np.isfinite(ring_witness) else None,
                 "witness_score": witness_score if np.isfinite(witness_score) else None,
             }
         )
@@ -3854,7 +6787,8 @@ def _build_angular_witness_report(
     *,
     observed_samples: pd.DataFrame,
     theta_roll_samples: pd.DataFrame,
-    center_jitter_samples: pd.DataFrame,
+    center_swap_samples: pd.DataFrame | None = None,
+    center_jitter_samples: pd.DataFrame | None = None,
     margin_min: float,
     d_min: float,
     p_max: float,
@@ -3866,7 +6800,10 @@ def _build_angular_witness_report(
 ) -> dict[str, Any]:
     obs = _compute_case_angular_scores(observed_samples)
     theta = _compute_case_angular_scores(theta_roll_samples)
-    center = _compute_case_angular_scores(center_jitter_samples)
+    center_swap_required = center_swap_samples is not None
+    center_swap_input = center_swap_samples if center_swap_required else theta_roll_samples
+    center_swap = _compute_case_angular_scores(center_swap_input)
+    center_jitter = _compute_case_angular_scores(center_jitter_samples) if center_jitter_samples is not None else pd.DataFrame()
     if obs.empty:
         return {"gate": {"required": bool(required), "passed": False, "reason": "no_polar_scores"}}
 
@@ -3877,55 +6814,95 @@ def _build_angular_witness_report(
     sd_ref = float(np.std(obs_scores_raw, ddof=1)) if obs_scores_raw.size > 1 else 0.0
     scale_ref = float(max(mad_ref, 0.25 * sd_ref, 1e-6))
 
-    def _summary(df: pd.DataFrame) -> dict[str, float]:
+    def _to_group_table(df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
-            return {"event_mean": 0.0, "far_mean": 0.0, "margin": 0.0, "event_rate": 0.0, "far_rate": 0.0}
-        ev = _event_mask_from_frame(df)
-        fv = ~ev
+            return pd.DataFrame(columns=["group_id", "is_event", "lead_bucket", "score"])
+        ev = _event_mask_from_frame(df).to_numpy(dtype=bool)
         s_raw = pd.to_numeric(df.get("witness_score"), errors="coerce").to_numpy(dtype=float)
         s = (s_raw - center_ref) / max(scale_ref, 1e-9)
+        group_id = (
+            df.get("track_group", df.get("case_id", pd.Series("", index=df.index)))
+            .fillna(df.get("case_id", pd.Series("", index=df.index)))
+            .astype(str)
+            .to_numpy(dtype=object)
+        )
+        lead = df.get("lead_bucket", pd.Series("", index=df.index)).fillna("").astype(str).to_numpy(dtype=object)
+        tmp = pd.DataFrame({"group_id": group_id, "is_event": ev.astype(int), "lead_bucket": lead, "score": s})
+        tmp = tmp.loc[np.isfinite(pd.to_numeric(tmp["score"], errors="coerce"))].copy()
+        if tmp.empty:
+            return pd.DataFrame(columns=["group_id", "is_event", "lead_bucket", "score"])
+        grp = (
+            tmp.groupby(["group_id", "is_event", "lead_bucket"], dropna=False)["score"]
+            .median()
+            .reset_index()
+        )
+        return grp
+
+    def _summary(group_df: pd.DataFrame) -> dict[str, float]:
+        if group_df is None or group_df.empty:
+            return {
+                "event_mean": 0.0,
+                "far_mean": 0.0,
+                "margin": 0.0,
+                "event_rate": 0.0,
+                "far_rate": 0.0,
+                "n_event_groups": 0,
+                "n_far_groups": 0,
+            }
+        ev = pd.to_numeric(group_df.get("is_event"), errors="coerce").fillna(0).astype(int) == 1
+        s = pd.to_numeric(group_df.get("score"), errors="coerce").to_numpy(dtype=float)
         se = s[ev.to_numpy(dtype=bool)] if bool(ev.any()) else np.array([], dtype=float)
-        sf = s[fv.to_numpy(dtype=bool)] if bool(fv.any()) else np.array([], dtype=float)
+        sf = s[(~ev).to_numpy(dtype=bool)] if bool((~ev).any()) else np.array([], dtype=float)
         se = se[np.isfinite(se)]
         sf = sf[np.isfinite(sf)]
-        event_mean = float(np.mean(se)) if se.size > 0 else 0.0
-        far_mean = float(np.mean(sf)) if sf.size > 0 else 0.0
+        event_mean = float(np.nanmean(se)) if se.size > 0 else 0.0
+        far_mean = float(np.nanmean(sf)) if sf.size > 0 else 0.0
         return {
             "event_mean": event_mean,
             "far_mean": far_mean,
             "margin": float(event_mean - far_mean),
             "event_rate": float(np.mean(se > 0.0)) if se.size > 0 else 0.0,
             "far_rate": float(np.mean(sf > 0.0)) if sf.size > 0 else 0.0,
+            "n_event_groups": int(se.size),
+            "n_far_groups": int(sf.size),
         }
 
-    obs_sum = _summary(obs)
-    theta_sum = _summary(theta)
-    center_sum = _summary(center)
+    obs_group = _to_group_table(obs)
+    theta_group = _to_group_table(theta)
+    center_swap_group = _to_group_table(center_swap)
+    center_jitter_group = _to_group_table(center_jitter)
 
-    ev_mask = _event_mask_from_frame(obs)
-    w_obs = pd.to_numeric(obs.get("witness_score"), errors="coerce").to_numpy(dtype=float)
-    ev_vals = w_obs[ev_mask.to_numpy(dtype=bool)]
-    far_vals = w_obs[(~ev_mask).to_numpy(dtype=bool)]
+    obs_sum = _summary(obs_group)
+    theta_sum = _summary(theta_group)
+    center_swap_sum = _summary(center_swap_group)
+    center_jitter_sum = _summary(center_jitter_group)
+
+    g_scores = pd.to_numeric(obs_group.get("score"), errors="coerce").to_numpy(dtype=float)
+    g_labels = pd.to_numeric(obs_group.get("is_event"), errors="coerce").fillna(0).astype(int).to_numpy(dtype=int)
+    g_groups = obs_group.get("lead_bucket", pd.Series("", index=obs_group.index)).astype(str).to_numpy(dtype=object)
+    ev_vals = g_scores[g_labels == 1]
+    far_vals = g_scores[g_labels == 0]
     ev_vals = ev_vals[np.isfinite(ev_vals)]
     far_vals = far_vals[np.isfinite(far_vals)]
     d_obs = _cohen_d(ev_vals, far_vals)
-    labels = ev_mask.astype(int).to_numpy(dtype=int)
-    groups = obs.get("lead_bucket", pd.Series("", index=obs.index)).astype(str).to_numpy(dtype=object)
     p_obs = _permutation_pvalue_margin(
-        scores=w_obs,
-        labels=labels,
-        groups=groups,
+        scores=g_scores,
+        labels=g_labels,
+        groups=g_groups,
         rng=np.random.default_rng(91013),
         n_perm=int(permutation_n),
     )
 
     margin_obs = float(obs_sum["margin"])
     margin_theta = float(theta_sum["margin"])
-    margin_center = float(center_sum["margin"])
+    margin_center_swap = float(center_swap_sum["margin"])
     drop_theta_abs = float(margin_obs - margin_theta)
     drop_theta_rel = float(drop_theta_abs / max(abs(margin_obs), 1e-9))
-    drop_center_abs = float(margin_obs - margin_center)
-    drop_center_rel = float(drop_center_abs / max(abs(margin_obs), 1e-9))
+    drop_center_swap_abs = float(margin_obs - margin_center_swap)
+    drop_center_swap_rel = float(drop_center_swap_abs / max(abs(margin_obs), 1e-9))
+    margin_center_jitter = float(center_jitter_sum["margin"])
+    drop_center_jitter_abs = float(margin_obs - margin_center_jitter)
+    drop_center_jitter_rel = float(drop_center_jitter_abs / max(abs(margin_obs), 1e-9))
     if not required:
         gate_passed = True
         reason = "not_required"
@@ -3935,20 +6912,27 @@ def _build_angular_witness_report(
             and (d_obs >= float(d_min))
             and (p_obs <= float(p_max))
             and (margin_theta <= float(null_margin_max))
-            and (margin_center <= float(null_margin_max))
             and (drop_theta_rel >= float(null_drop_min))
             and (drop_theta_abs >= float(null_abs_drop_min))
-            and (drop_center_rel >= float(null_drop_min))
-            and (drop_center_abs >= float(null_abs_drop_min))
+            and (
+                (not center_swap_required)
+                or (
+                    (margin_center_swap <= float(null_margin_max))
+                    and (drop_center_swap_rel >= float(null_drop_min))
+                    and (drop_center_swap_abs >= float(null_abs_drop_min))
+                )
+            )
         )
         reason = "ok" if gate_passed else "threshold_fail"
-    return {
+    report: dict[str, Any] = {
         "observed": {
             "event_mean": float(obs_sum["event_mean"]),
             "far_mean": float(obs_sum["far_mean"]),
             "margin": float(margin_obs),
             "event_rate": float(obs_sum["event_rate"]),
             "far_rate": float(obs_sum["far_rate"]),
+            "n_event_groups": int(obs_sum.get("n_event_groups", 0)),
+            "n_far_groups": int(obs_sum.get("n_far_groups", 0)),
             "effect_size_d": float(d_obs),
             "p_value_perm": float(p_obs),
         },
@@ -3961,14 +6945,15 @@ def _build_angular_witness_report(
             "drop_abs_event": drop_theta_abs,
             "drop_rel_event": drop_theta_rel,
         },
-        "center_jitter": {
-            "event_mean": float(center_sum["event_mean"]),
-            "far_mean": float(center_sum["far_mean"]),
-            "margin": float(margin_center),
-            "event_rate": float(center_sum["event_rate"]),
-            "far_rate": float(center_sum["far_rate"]),
-            "drop_abs_event": drop_center_abs,
-            "drop_rel_event": drop_center_rel,
+        "center_swap": {
+            "required": bool(center_swap_required),
+            "event_mean": float(center_swap_sum["event_mean"]),
+            "far_mean": float(center_swap_sum["far_mean"]),
+            "margin": float(margin_center_swap),
+            "event_rate": float(center_swap_sum["event_rate"]),
+            "far_rate": float(center_swap_sum["far_rate"]),
+            "drop_abs_event": drop_center_swap_abs,
+            "drop_rel_event": drop_center_swap_rel,
         },
         "gate": {
             "required": bool(required),
@@ -3989,6 +6974,17 @@ def _build_angular_witness_report(
             "std_ref": float(sd_ref),
         },
     }
+    if center_jitter_samples is not None:
+        report["center_jitter"] = {
+            "event_mean": float(center_jitter_sum["event_mean"]),
+            "far_mean": float(center_jitter_sum["far_mean"]),
+            "margin": float(margin_center_jitter),
+            "event_rate": float(center_jitter_sum["event_rate"]),
+            "far_rate": float(center_jitter_sum["far_rate"]),
+            "drop_abs_event": drop_center_jitter_abs,
+            "drop_rel_event": drop_center_jitter_rel,
+        }
+    return report
 
 
 def _assemble_case_metrics_from_mode_selection(
@@ -4166,6 +7162,10 @@ def _build_parity_confound_dashboard(
                 "eta_sign_consistency": float(abs(np.mean(sgn))),
                 "parity_signal_pass": bool(rec.get("parity_signal_pass", False)),
                 "parity_signal_pass_effective": bool(rec.get("parity_signal_pass_effective", rec.get("parity_signal_pass", False))),
+                "parity_localization_pass": bool(rec.get("parity_localization_pass", False)),
+                "parity_tangential_pass": bool(rec.get("parity_tangential_pass", False)),
+                "odd_energy_inner_outer_ratio": _to_float(rec.get("odd_energy_inner_outer_ratio")),
+                "tangential_radial_ratio": _to_float(rec.get("tangential_radial_ratio")),
                 "knee_size_detected": bool(rec.get("knee_detected", False)),
                 "knee_tf_detected": bool(rec.get("tf_knee_detected", False)),
                 "knee_tf_null_gate_pass": bool(rec.get("tf_knee_null_gate_pass", False)),
@@ -4268,6 +7268,51 @@ def _build_parity_breakdown(confound_df: pd.DataFrame, *, axis_meta: dict[str, A
             "contrast_by_lon0": axis_meta.get("contrast_by_lon0"),
         },
     }
+
+
+def _build_far_cleanliness_dashboard(samples: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if samples is None or samples.empty:
+        return pd.DataFrame(), {"n_cases": 0}
+    frame = samples.copy()
+    if "case_id" not in frame.columns:
+        return pd.DataFrame(), {"n_cases": 0, "reason": "missing_case_id"}
+    frame["split_stratum"] = _derive_strata_labels(frame)
+    frame = frame.loc[frame["split_stratum"] == "far_nonstorm"].copy()
+    if frame.empty:
+        return pd.DataFrame(), {"n_cases": 0}
+
+    rows: list[dict[str, Any]] = []
+    for case_id, grp in frame.groupby("case_id", dropna=False):
+        rows.append(
+            {
+                "case_id": str(case_id),
+                "lead_bucket": str(grp.get("lead_bucket", pd.Series(index=grp.index)).iloc[0]) if "lead_bucket" in grp.columns else "",
+                "control_tier": str(grp.get("control_tier", pd.Series(index=grp.index)).iloc[0]) if "control_tier" in grp.columns else "",
+                "ib_far_quality_tag": str(grp.get("ib_far_quality_tag", pd.Series(index=grp.index)).iloc[0]) if "ib_far_quality_tag" in grp.columns else "missing",
+                "ib_far_strict": bool((pd.to_numeric(grp.get("ib_far_strict", grp.get("ib_far", 0)), errors="coerce").fillna(0) > 0).any()),
+                "ib_dist_km_median": _to_float(pd.to_numeric(grp.get("ib_dist_km", grp.get("nearest_storm_distance_km")), errors="coerce").median()),
+                "ib_min_dist_window_km_median": _to_float(
+                    pd.to_numeric(
+                        grp.get("nearest_storm_min_dist_window_km", grp.get("nearest_storm_min_dist_window_km_source")),
+                        errors="coerce",
+                    ).median()
+                ),
+                "case_speed_bin": _to_float(pd.to_numeric(grp.get("case_speed_bin"), errors="coerce").median()),
+                "case_zeta_bin": _to_float(pd.to_numeric(grp.get("case_zeta_bin"), errors="coerce").median()),
+                "storm_distance_cohort": str(grp.get("storm_distance_cohort", pd.Series(index=grp.index)).iloc[0]) if "storm_distance_cohort" in grp.columns else "",
+            }
+        )
+    out = pd.DataFrame(rows)
+    summary = {
+        "n_cases": int(out.shape[0]),
+        "by_quality_tag": out.get("ib_far_quality_tag", pd.Series(dtype=object)).fillna("missing").astype(str).value_counts(dropna=False).to_dict(),
+        "strict_far_rate": float(pd.to_numeric(out.get("ib_far_strict"), errors="coerce").fillna(0).mean()) if "ib_far_strict" in out.columns else 0.0,
+        "by_lead": {
+            str(k): int(v)
+            for k, v in out.get("lead_bucket", pd.Series(dtype=object)).fillna("missing").astype(str).value_counts(dropna=False).to_dict().items()
+        },
+    }
+    return out, summary
 
 
 def _detect_time_frequency_knee(
@@ -4528,29 +7573,48 @@ def _build_ibtracs_strict_eval(
     far_min_km: float,
     time_hours: float,
     p_lock_threshold: float,
+    use_flags: bool = False,
+    time_basis: str = "selected",
 ) -> dict[str, Any]:
     if case_metrics is None or case_metrics.empty:
-        return {"available": False, "reason": "no_case_metrics"}
+        return {"available": False, "reason": "no_case_metrics", "time_basis": str(time_basis)}
 
     case_df = case_metrics.copy()
     case_df["case_id"] = case_df["case_id"].astype(str)
 
     # Fill distance/time metadata from samples if missing in case_metrics.
-    dist_col_candidates = [
-        c
-        for c in (
-            "ib_dist_km",
-            "nearest_storm_distance_km",
-            "storm_dist_km",
+    basis = str(time_basis or "selected").strip().lower()
+    if basis not in {"source", "valid", "selected"}:
+        basis = "selected"
+    if basis == "source":
+        dist_pref = ("ib_dist_km_source", "nearest_storm_distance_km_source", "storm_dist_km")
+        time_pref = (
+            "ib_dt_hours_source",
+            "nearest_storm_time_delta_h_source",
+            "nearest_storm_time_delta_hours_source",
+            "storm_time_delta_h_source",
+            "storm_time_delta_hours_source",
+            "ibtracs_time_delta_h_source",
+            "ibtracs_time_delta_hours_source",
         )
-        if c in samples.columns
-    ]
-    meta_cols = [c for c in ("case_id",) if c in samples.columns]
-    if dist_col_candidates:
-        meta_cols.append(dist_col_candidates[0])
-    time_delta_candidates = [
-        c
-        for c in (
+        event_flag_pref = ("ib_event_strict_source", "ib_event_source", "ib_event_strict", "ib_event")
+        far_flag_pref = ("ib_far_strict_source", "ib_far_source", "ib_far_strict", "ib_far")
+    elif basis == "valid":
+        dist_pref = ("ib_dist_km_valid", "nearest_storm_distance_km_valid", "storm_dist_km")
+        time_pref = (
+            "ib_dt_hours_valid",
+            "nearest_storm_time_delta_h_valid",
+            "nearest_storm_time_delta_hours_valid",
+            "storm_time_delta_h_valid",
+            "storm_time_delta_hours_valid",
+            "ibtracs_time_delta_h_valid",
+            "ibtracs_time_delta_hours_valid",
+        )
+        event_flag_pref = ("ib_event_strict_valid", "ib_event_valid", "ib_event_strict", "ib_event")
+        far_flag_pref = ("ib_far_strict_valid", "ib_far_valid", "ib_far_strict", "ib_far")
+    else:
+        dist_pref = ("ib_dist_km", "nearest_storm_distance_km", "storm_dist_km")
+        time_pref = (
             "ib_dt_hours",
             "nearest_storm_time_delta_h",
             "nearest_storm_time_delta_hours",
@@ -4559,10 +7623,19 @@ def _build_ibtracs_strict_eval(
             "ibtracs_time_delta_h",
             "ibtracs_time_delta_hours",
         )
-        if c in samples.columns
-    ]
+        event_flag_pref = ("ib_event_strict", "ib_event", "ib_event_strict_max", "ib_event_max")
+        far_flag_pref = ("ib_far_strict", "ib_far", "ib_far_strict_max", "ib_far_max")
+
+    dist_col_candidates = [c for c in dist_pref if c in samples.columns]
+    meta_cols = [c for c in ("case_id",) if c in samples.columns]
+    if dist_col_candidates:
+        meta_cols.append(dist_col_candidates[0])
+    time_delta_candidates = [c for c in time_pref if c in samples.columns]
     if time_delta_candidates:
         meta_cols.append(time_delta_candidates[0])
+    for col in ("ib_event_strict", "ib_far_strict", "ib_event", "ib_far", "ib_far_quality_tag"):
+        if col in samples.columns:
+            meta_cols.append(col)
     if "storm_id_nearest" in samples.columns:
         meta_cols.append("storm_id_nearest")
     elif "storm_id" in samples.columns:
@@ -4577,6 +7650,11 @@ def _build_ibtracs_strict_eval(
                 {
                     **({dist_col_candidates[0]: "median"} if dist_col_candidates else {}),
                     **({time_delta_candidates[0]: "median"} if time_delta_candidates else {}),
+                    **({"ib_event_strict": "max"} if "ib_event_strict" in meta_cols else {}),
+                    **({"ib_far_strict": "max"} if "ib_far_strict" in meta_cols else {}),
+                    **({"ib_event": "max"} if "ib_event" in meta_cols else {}),
+                    **({"ib_far": "max"} if "ib_far" in meta_cols else {}),
+                    **({"ib_far_quality_tag": "first"} if "ib_far_quality_tag" in meta_cols else {}),
                     **({"storm_id_nearest": "first"} if "storm_id_nearest" in meta_cols else {}),
                     **({"storm_id": "first"} if "storm_id" in meta_cols else {}),
                 }
@@ -4587,19 +7665,30 @@ def _build_ibtracs_strict_eval(
     dist_case_col = dist_col_candidates[0] if dist_col_candidates else "nearest_storm_distance_km"
     dist = pd.to_numeric(case_df.get(dist_case_col), errors="coerce")
     if dist.isna().all():
-        return {"available": False, "reason": "missing_nearest_storm_distance_km"}
+        return {"available": False, "reason": "missing_nearest_storm_distance_km", "time_basis": basis}
 
     event_mask = dist <= float(radius_km)
     if time_delta_candidates:
         td = pd.to_numeric(case_df.get(time_delta_candidates[0]), errors="coerce").abs()
         event_mask = event_mask & (td <= float(time_hours))
     far_mask = dist >= float(far_min_km)
+
+    event_flag_cols = [c for c in event_flag_pref if c in case_df.columns]
+    if not event_flag_cols:
+        event_flag_cols = [c for c in ("ib_event_strict_max", "ib_event_strict", "ib_event_max", "ib_event") if c in case_df.columns]
+    far_flag_cols = [c for c in far_flag_pref if c in case_df.columns]
+    if not far_flag_cols:
+        far_flag_cols = [c for c in ("ib_far_strict_max", "ib_far_strict", "ib_far_max", "ib_far") if c in case_df.columns]
+    if bool(use_flags) and event_flag_cols and far_flag_cols:
+        event_mask = pd.to_numeric(case_df.get(event_flag_cols[0]), errors="coerce").fillna(0) > 0
+        far_mask = pd.to_numeric(case_df.get(far_flag_cols[0]), errors="coerce").fillna(0) > 0
     event_df = case_df.loc[event_mask].copy()
     far_df = case_df.loc[far_mask].copy()
     if event_df.empty or far_df.empty:
         return {
             "available": False,
             "reason": "insufficient_strict_or_far_cases",
+            "time_basis": basis,
             "n_event_cases": int(event_df.shape[0]),
             "n_far_cases": int(far_df.shape[0]),
             "dist_km_summary": _summary_numeric(dist),
@@ -4624,6 +7713,7 @@ def _build_ibtracs_strict_eval(
 
     return {
         "available": True,
+        "time_basis": basis,
         "radius_km": float(radius_km),
         "far_min_km": float(far_min_km),
         "time_hours": float(time_hours),
@@ -4635,6 +7725,9 @@ def _build_ibtracs_strict_eval(
         "confound_rate": float(far_rate / max(event_rate, 1e-9)),
         "distance_col_used": str(dist_case_col),
         "time_col_used": str(time_delta_candidates[0]) if time_delta_candidates else None,
+        "event_flag_col_used": str(event_flag_cols[0]) if (bool(use_flags) and event_flag_cols) else None,
+        "far_flag_col_used": str(far_flag_cols[0]) if (bool(use_flags) and far_flag_cols) else None,
+        "strict_mask_source": "flags" if (bool(use_flags) and event_flag_cols and far_flag_cols) else "distance_time",
         "dist_km_summary": _summary_numeric(dist),
         "dt_hours_summary": (
             _summary_numeric(pd.to_numeric(case_df.get(time_delta_candidates[0]), errors="coerce").abs())
@@ -4650,6 +7743,16 @@ def _build_ibtracs_strict_eval(
             if time_delta_candidates
             else None
         ),
+        "far_quality_tag_counts": (
+            case_df.get("ib_far_quality_tag", pd.Series(dtype=object)).fillna("missing").astype(str).value_counts(dropna=False).to_dict()
+            if "ib_far_quality_tag" in case_df.columns
+            else {}
+        ),
+        "center_source_counts": (
+            case_df.get("center_source", pd.Series(dtype=object)).fillna("unknown").astype(str).value_counts(dropna=False).to_dict()
+            if "center_source" in case_df.columns
+            else {}
+        ),
         "by_lead": by_lead,
     }
 
@@ -4661,6 +7764,7 @@ def _build_ibtracs_alignment_gate(
     min_far_cases: int,
     margin_min: float,
     confound_max: float,
+    extra_reasons: list[str] | None = None,
 ) -> dict[str, Any]:
     info = strict_eval or {}
     reasons: list[str] = []
@@ -4725,6 +7829,9 @@ def _build_ibtracs_alignment_gate(
         reasons.append("lon_wrap_suspected")
     if suspect_center_mismatch:
         reasons.append("center_definition_mismatch")
+    for r in (extra_reasons or []):
+        if r:
+            reasons.append(str(r))
     passed = bool(len(reasons) == 0)
     actions: list[str] = []
     if not passed:
@@ -4741,6 +7848,25 @@ def _build_ibtracs_alignment_gate(
             actions.append("normalize_longitudes_to_minus180_180_before_matching")
         if any("center_definition_mismatch" in r for r in reasons):
             actions.append("calibrate_vortex_center_definition_against_ibtracs")
+        if any("basis_flip_changes_label" in r for r in reasons):
+            actions.append("compare_source_vs_valid_time_basis_and_lock_one_contract")
+    reason_code_counts = pd.Series(reasons, dtype=object).value_counts(dropna=False).to_dict() if reasons else {}
+    remediation_hints = {
+        str(code): [
+            "increase_strict_overlay_coverage_or_adjust_split"
+            if "too_few_ibtracs_" in str(code)
+            else "use_valid_time_for_ibtracs_matching"
+            if "time_basis_mismatch" in str(code)
+            else "normalize_longitudes_to_minus180_180_before_matching"
+            if "lon_wrap" in str(code)
+            else "audit_distance_units_and_haversine_inputs"
+            if "distance_units" in str(code)
+            else "calibrate_vortex_center_definition_against_ibtracs"
+            if "center_definition" in str(code)
+            else "verify_event_vs_far_cohort_definition_and_distance_thresholds"
+        ]
+        for code in reason_code_counts.keys()
+    }
     return {
         "passed": bool(passed),
         "available": bool(available),
@@ -4771,8 +7897,58 @@ def _build_ibtracs_alignment_gate(
             },
         },
         "reason_codes": reasons,
+        "reason_code_counts": reason_code_counts,
         "actions": actions,
+        "remediation_hints": remediation_hints,
     }
+
+
+def _build_time_basis_audit_from_samples(samples: pd.DataFrame) -> dict[str, Any]:
+    if samples is None or samples.empty:
+        return {"available": False, "n_rows": 0}
+    s = samples.copy()
+    out = {
+        "available": True,
+        "n_rows": int(s.shape[0]),
+        "time_basis_used_counts": s.get("ib_time_basis_used", s.get("time_basis", pd.Series(index=s.index))).fillna("unknown").astype(str).value_counts(dropna=False).to_dict(),
+    }
+    if {"ib_event_source", "ib_event_valid"}.issubset(set(s.columns)):
+        ev_s = (pd.to_numeric(s["ib_event_source"], errors="coerce").fillna(0) > 0).astype(int)
+        ev_v = (pd.to_numeric(s["ib_event_valid"], errors="coerce").fillna(0) > 0).astype(int)
+        out["event_label_flip_rate"] = float((ev_s != ev_v).mean())
+    if {"ib_far_source", "ib_far_valid"}.issubset(set(s.columns)):
+        far_s = (pd.to_numeric(s["ib_far_source"], errors="coerce").fillna(0) > 0).astype(int)
+        far_v = (pd.to_numeric(s["ib_far_valid"], errors="coerce").fillna(0) > 0).astype(int)
+        out["far_label_flip_rate"] = float((far_s != far_v).mean())
+    if {"nearest_storm_id_source", "nearest_storm_id_valid"}.issubset(set(s.columns)):
+        sid_s = s["nearest_storm_id_source"].fillna("").astype(str)
+        sid_v = s["nearest_storm_id_valid"].fillna("").astype(str)
+        out["nearest_storm_id_flip_rate"] = float((sid_s != sid_v).mean())
+    return out
+
+
+def _build_center_definition_audit_from_samples(samples: pd.DataFrame) -> dict[str, Any]:
+    if samples is None or samples.empty:
+        return {"available": False, "n_rows": 0}
+    s = samples.copy()
+    dist = pd.to_numeric(s.get("nearest_storm_distance_km"), errors="coerce")
+    out: dict[str, Any] = {
+        "available": True,
+        "n_rows": int(s.shape[0]),
+        "center_to_storm_dist_km_summary": _summary_numeric(dist),
+        "center_mismatch_gt200km_rate": float((dist > 200.0).mean()) if dist.notna().any() else 0.0,
+    }
+    if "center_source" in s.columns:
+        by_src: dict[str, Any] = {}
+        for src, grp in s.groupby(s["center_source"].fillna("unknown").astype(str), dropna=False):
+            d = pd.to_numeric(grp.get("nearest_storm_distance_km"), errors="coerce")
+            by_src[str(src)] = {
+                "n_rows": int(grp.shape[0]),
+                "dist_km_summary": _summary_numeric(d),
+                "mismatch_gt200km_rate": float((d > 200.0).mean()) if d.notna().any() else 0.0,
+            }
+        out["by_center_source"] = by_src
+    return out
 
 
 def _file_sha256(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -4833,6 +8009,12 @@ def _build_eval_command_tokens(args: argparse.Namespace, *, out_path: Path) -> l
             if value:
                 tokens.append(opt)
             continue
+        if isinstance(value, (list, tuple)):
+            if not value:
+                continue
+            tokens.append(opt)
+            tokens.extend([str(v) for v in value])
+            continue
         if value is None:
             continue
         tokens.extend([opt, str(value)])
@@ -4848,6 +8030,7 @@ def _build_claim_contract(
     out_path: Path,
 ) -> dict[str, Any]:
     repo_dir = Path(__file__).resolve().parents[2]
+    applied_parity = (summary.get("parity_thresholds_applied") or {}) if isinstance(summary, dict) else {}
     contract = {
         "schema_version": int(getattr(args, "claim_contract_schema_version", 1)),
         "generated_at_utc": utc_now_iso(),
@@ -4874,6 +8057,31 @@ def _build_claim_contract(
                 "margin_min": float(getattr(args, "parity_event_minus_far_min", 0.0)),
                 "far_max": float(getattr(args, "parity_far_max", 0.0)),
                 "ratio_max": float(getattr(args, "parity_confound_max_ratio", 0.0)),
+                "use_alignment_fraction": bool(getattr(args, "parity_use_alignment_fraction", True)),
+                "alignment_eta_threshold": float(getattr(args, "alignment_eta_threshold", 0.10)),
+                "alignment_block_hours": float(getattr(args, "alignment_block_hours", 3.0)),
+                "odd_inner_outer_min": float(
+                    _to_float(applied_parity.get("odd_inner_outer_min"))
+                    if _to_float(applied_parity.get("odd_inner_outer_min")) is not None
+                    else float(getattr(args, "parity_odd_inner_outer_min", 0.0))
+                ),
+                "tangential_radial_min": float(
+                    _to_float(applied_parity.get("tangential_radial_min"))
+                    if _to_float(applied_parity.get("tangential_radial_min")) is not None
+                    else float(getattr(args, "parity_tangential_radial_min", 0.0))
+                ),
+                "inner_ring_quantile": float(
+                    _to_float(applied_parity.get("inner_ring_quantile"))
+                    if _to_float(applied_parity.get("inner_ring_quantile")) is not None
+                    else float(getattr(args, "parity_inner_ring_quantile", 0.5))
+                ),
+                "calibration_event_min_floor": float(getattr(args, "parity_calibration_event_min_floor", 0.05)),
+                "calibration_constrain_min_thresholds": bool(getattr(args, "parity_calibration_constrain_min_thresholds", False)),
+                "far_quality_tags": [str(v) for v in (summary.get("claim_far_quality_tags", []) or [])],
+                "strict_far_min_row_quality_frac": float(getattr(args, "strict_far_min_row_quality_frac", 0.0)),
+                "strict_far_min_kinematic_clean_frac": float(getattr(args, "strict_far_min_kinematic_clean_frac", 0.0)),
+                "strict_far_min_any_storm_km": float(getattr(args, "strict_far_min_any_storm_km", 0.0)),
+                "strict_far_min_nearest_storm_km": float(getattr(args, "strict_far_min_nearest_storm_km", 0.0)),
             },
             "anomaly_gate": {
                 "selected_all_leads_required": True,
@@ -4882,9 +8090,10 @@ def _build_claim_contract(
                 "agreement_min_min": float(getattr(args, "anomaly_agreement_min_min", 0.0)),
             },
             "geometry_null_collapse": {
-                "required_checks": ["theta_roll", "center_jitter"],
+                "required_checks": [str(v) for v in (summary.get("geometry_required_checks", []) or [])],
                 "relative_drop_min": float(getattr(args, "null_collapse_min_drop", 0.0)),
                 "absolute_drop_min": float(getattr(args, "null_collapse_min_abs_drop", 0.0)),
+                "null_no_signal_max_rate": float(getattr(args, "null_no_signal_max_rate", 0.0)),
             },
             "angular_witness": {
                 "margin_min": float(getattr(args, "angular_witness_margin_min", 0.0)),
@@ -4900,6 +8109,7 @@ def _build_claim_contract(
                 "min_far_cases": int(getattr(args, "ibtracs_alignment_min_far_cases", 0)),
                 "margin_min": float(getattr(args, "ibtracs_alignment_margin_min", 0.0)),
                 "confound_max": float(getattr(args, "ibtracs_alignment_confound_max", 1.0)),
+                "strict_use_flags": bool(getattr(args, "ibtracs_strict_use_flags", False)),
             },
         },
         "knee_policy": {

@@ -190,6 +190,8 @@ def interpolate_ibtracs_hourly(
         lon_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(lon_src)))
         lat_itp = np.interp(trg_t, src_t, lat_src)
         lon_itp = np.mod(np.interp(trg_t, src_t, lon_unwrapped), 360.0)
+        dt_nearest_h = _nearest_time_delta_hours(trg_t=trg_t, src_t=src_t)
+        interp_flag = np.where(dt_nearest_h <= (1.0 / 60.0), "exact", "interpolated")
 
         wind_src = (
             pd.to_numeric(g["wind"], errors="coerce").to_numpy(dtype=float)
@@ -203,6 +205,19 @@ def interpolate_ibtracs_hourly(
         )
         wind_itp = np.interp(trg_t, src_t, wind_src) if np.sum(np.isfinite(wind_src)) >= 2 else np.full(trg_t.shape, np.nan)
         pres_itp = np.interp(trg_t, src_t, pres_src) if np.sum(np.isfinite(pres_src)) >= 2 else np.full(trg_t.shape, np.nan)
+        speed_kmh = np.full(trg_t.shape, np.nan, dtype=float)
+        if trg_t.size >= 2:
+            step_h = np.diff(trg_t) / 3600.0
+            step_h = np.where(step_h > 0.0, step_h, np.nan)
+            step_km = haversine_km_vec(
+                lat_itp[:-1],
+                lon_itp[:-1],
+                lat_itp[1:],
+                lon_itp[1:],
+            )
+            step_speed = step_km / step_h
+            speed_kmh[1:] = step_speed
+            speed_kmh[0] = step_speed[0] if step_speed.size > 0 else np.nan
 
         name = str(g["name"].dropna().iloc[0]) if "name" in g.columns and g["name"].notna().any() else None
         basin = str(g["basin"].dropna().iloc[0]) if "basin" in g.columns and g["basin"].notna().any() else None
@@ -220,6 +235,13 @@ def interpolate_ibtracs_hourly(
         )
 
         for i, t in enumerate(target):
+            dt_fix_h = float(dt_nearest_h[i]) if np.isfinite(dt_nearest_h[i]) else np.nan
+            spd_kmh = float(speed_kmh[i]) if np.isfinite(speed_kmh[i]) else np.nan
+            center_uncert_km = (
+                float(min(500.0, max(0.0, 0.5 * spd_kmh * dt_fix_h)))
+                if np.isfinite(spd_kmh) and np.isfinite(dt_fix_h)
+                else np.nan
+            )
             rows.append(
                 {
                     "storm_id": str(storm_id),
@@ -233,6 +255,11 @@ def interpolate_ibtracs_hourly(
                     "pres": float(pres_itp[i]) if np.isfinite(pres_itp[i]) else np.nan,
                     "source_wind_col": wind_src_col,
                     "source_pres_col": pres_src_col,
+                    "dt_to_nearest_ib_hours": dt_fix_h,
+                    "interp_flag": str(interp_flag[i]),
+                    "speed_kmh": spd_kmh,
+                    "speed_qc_flag": bool(np.isfinite(spd_kmh) and (spd_kmh > 160.0)),
+                    "center_uncert_km": center_uncert_km,
                 }
             )
 
@@ -411,12 +438,25 @@ def _coalesce_numeric(df: pd.DataFrame, cols: Iterable[str]) -> tuple[pd.Series,
     return values, source
 
 
-def haversine_km_vec(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+def haversine_km_vec(lat1: float | np.ndarray, lon1: float | np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
     r = 6_371.0
-    p1 = np.deg2rad(float(lat1))
+    p1 = np.deg2rad(np.asarray(lat1, dtype=float))
     p2 = np.deg2rad(np.asarray(lat2, dtype=float))
     dp = p2 - p1
-    dl = np.deg2rad(np.asarray(lon2, dtype=float) - float(lon1))
+    dl = np.deg2rad(np.asarray(lon2, dtype=float) - np.asarray(lon1, dtype=float))
     a = np.sin(dp / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2.0) ** 2
     c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(np.clip(1.0 - a, 0.0, None)))
     return r * c
+
+
+def _nearest_time_delta_hours(*, trg_t: np.ndarray, src_t: np.ndarray) -> np.ndarray:
+    if trg_t.size == 0:
+        return np.array([], dtype=float)
+    if src_t.size == 0:
+        return np.full(trg_t.shape, np.nan, dtype=float)
+    idx = np.searchsorted(src_t, trg_t, side="left")
+    prev_idx = np.clip(idx - 1, 0, src_t.size - 1)
+    next_idx = np.clip(idx, 0, src_t.size - 1)
+    dt_prev = np.abs(trg_t - src_t[prev_idx]) / 3600.0
+    dt_next = np.abs(src_t[next_idx] - trg_t) / 3600.0
+    return np.minimum(dt_prev, dt_next)

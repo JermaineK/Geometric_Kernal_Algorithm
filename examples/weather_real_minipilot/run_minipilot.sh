@@ -25,6 +25,8 @@ python examples/weather_real_minipilot/build_tiles.py \
   --cohort all \
   --centers hybrid \
   --distance-time-tolerance-hours 3.0 \
+  --distance-far-km 1000 \
+  --distance-far-loose-km 2000 \
   --scan-batch-rows 120000 \
   --background-pool-max-rows 300000 \
   --background-max-batches-per-lead 0 \
@@ -102,4 +104,5 @@ python examples/weather_real_minipilot/evaluate_minipilot.py \
   --enable-time-frequency-knee \
   --tf-knee-bic-delta-min 6.0 \
   --slowtick-delta-min 0.05 \
-  --slowtick-p-max 0.10
+  --slowtick-p-max 0.10 \
+  --ibtracs-strict-use-flags

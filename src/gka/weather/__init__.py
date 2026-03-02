@@ -6,6 +6,7 @@ from gka.weather.ibtracs import (
     match_tracks_to_ibtracs,
     prepare_ibtracs_catalog,
 )
+from gka.weather.contract import CoverageContract, TimeBasis, strict_coverage_ok, strict_ib_case_flags, strict_ib_coverage
 from gka.weather.polar import summarize_polar_features
 from gka.weather.vortex import discover_vortex_tracks, save_vortex_discovery_artifacts
 from gka.weather.vortex_detect import detect_vortex_candidates
@@ -23,4 +24,9 @@ __all__ = [
     "interpolate_ibtracs_hourly",
     "prepare_ibtracs_catalog",
     "match_tracks_to_ibtracs",
+    "TimeBasis",
+    "CoverageContract",
+    "strict_ib_case_flags",
+    "strict_ib_coverage",
+    "strict_coverage_ok",
 ]

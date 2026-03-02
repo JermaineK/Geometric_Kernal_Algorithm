@@ -7,7 +7,7 @@
   "schema_version": 1,
   "source": {
     "n_rows": 20,
-    "parameter_runs_path": "C:\\GKA\\Geometric_Kernal_Algorithm\\tests\\stress\\outputs\\robustness\\parameter_sweep\\parameter_runs.json",
+    "parameter_runs_path": "C:\\GKA\\Geometric_Kernel_Algorithm\\tests\\stress\\outputs\\robustness\\parameter_sweep\\parameter_runs.json",
     "parameter_runs_sha256": "7fa17cf2a99938ca8cd0124bfb50f3935bd1d512de68aee85e4cf4e2569ffd6e"
   },
   "thresholds": {
