@@ -105,4 +105,7 @@ python examples/weather_real_minipilot/evaluate_minipilot.py \
   --tf-knee-bic-delta-min 6.0 \
   --slowtick-delta-min 0.05 \
   --slowtick-p-max 0.10 \
+  --min-calib-event-cases 10 \
+  --min-calib-far-cases 20 \
+  --calib-skip-default-threshold 0.5 \
   --ibtracs-strict-use-flags

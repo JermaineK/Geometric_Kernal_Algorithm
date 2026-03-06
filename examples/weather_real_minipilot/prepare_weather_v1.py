@@ -24,6 +24,8 @@ DEFAULT_COLUMNS = [
     "ilon",
     "u10",
     "v10",
+    "u850",
+    "v850",
     "lead_h",
     "lead_h_bucket",
     "storm_point",
@@ -70,6 +72,26 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Optional mirror-axis sweep for parity sensitivity audit (e.g. 145 150 155 160)",
+    )
+    parser.add_argument(
+        "--parity-axis-mode",
+        choices=["static", "steering"],
+        default="steering",
+        help="Parity mirror axis mode: static uses --lon0, steering computes a dynamic axis from steering flow",
+    )
+    parser.add_argument("--steering-u-col", default="u850", help="Preferred zonal wind column for steering axis")
+    parser.add_argument("--steering-v-col", default="v850", help="Preferred meridional wind column for steering axis")
+    parser.add_argument(
+        "--steering-radius-deg",
+        type=float,
+        default=5.0,
+        help="Scale used to project steering-perpendicular axis in longitude degrees",
+    )
+    parser.add_argument(
+        "--steering-calm-threshold-ms",
+        type=float,
+        default=0.5,
+        help="Calm-wind threshold (m/s) below which the dynamic axis falls back to center longitude",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed (logged for reproducibility)")
     return parser.parse_args()
@@ -136,6 +158,11 @@ def main() -> int:
                     lon0=float(args.lon0),
                     max_lon_distance=float(args.max_lon_distance),
                     scalar_cols=scalar_cols,
+                    parity_axis_mode=str(args.parity_axis_mode),
+                    steering_u_col=str(args.steering_u_col),
+                    steering_v_col=str(args.steering_v_col),
+                    steering_radius_deg=float(args.steering_radius_deg),
+                    steering_calm_threshold_ms=float(args.steering_calm_threshold_ms),
                 )
                 _accumulate_mirror_audit(mirror_audit, audit_delta)
                 if lon0_sweep:
@@ -169,6 +196,11 @@ def main() -> int:
         "date_from": str(date_from.date()) if date_from is not None else None,
         "date_to": str(date_to.date()) if date_to is not None else None,
         "mirror": {"lon0": float(args.lon0), "max_lon_distance": float(args.max_lon_distance)},
+        "parity_axis_mode": str(args.parity_axis_mode),
+        "steering_u_col": str(args.steering_u_col),
+        "steering_v_col": str(args.steering_v_col),
+        "steering_radius_deg": float(args.steering_radius_deg),
+        "steering_calm_threshold_ms": float(args.steering_calm_threshold_ms),
         "read_columns": read_cols,
         "completed_time_slices": int(completed_times),
         "written_files": int(written_files),
@@ -202,11 +234,46 @@ def _process_one_time(
     lon0: float,
     max_lon_distance: float,
     scalar_cols: list[str],
+    parity_axis_mode: str,
+    steering_u_col: str,
+    steering_v_col: str,
+    steering_radius_deg: float,
+    steering_calm_threshold_ms: float,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     in_rows = int(frame.shape[0])
+    axis_mode = str(parity_axis_mode).strip().lower()
+    axis_lon_static = float(lon0)
+    axis_lon_dynamic = float(lon0)
+    axis_lon_used = float(lon0)
+    steering_u_mean = np.nan
+    steering_v_mean = np.nan
+    steering_source = "static"
+    if axis_mode == "steering":
+        u_col = str(steering_u_col)
+        v_col = str(steering_v_col)
+        if u_col not in frame.columns or v_col not in frame.columns:
+            u_col = "u10"
+            v_col = "v10"
+        u_vals = pd.to_numeric(frame.get(u_col), errors="coerce").to_numpy(dtype=float)
+        v_vals = pd.to_numeric(frame.get(v_col), errors="coerce").to_numpy(dtype=float)
+        steering_u_mean = float(np.nanmean(u_vals)) if np.isfinite(u_vals).any() else np.nan
+        steering_v_mean = float(np.nanmean(v_vals)) if np.isfinite(v_vals).any() else np.nan
+        lat_center = float(pd.to_numeric(frame.get("lat"), errors="coerce").median())
+        lon_center = float(pd.to_numeric(frame.get("lon"), errors="coerce").median())
+        if np.isfinite(steering_u_mean) and np.isfinite(steering_v_mean) and np.isfinite(lat_center) and np.isfinite(lon_center):
+            axis_lon_dynamic = compute_steering_axis_lon(
+                u850=steering_u_mean,
+                v850=steering_v_mean,
+                lat_center=lat_center,
+                lon_center=lon_center,
+                radius_deg=float(steering_radius_deg),
+                calm_threshold_ms=float(steering_calm_threshold_ms),
+            )
+            steering_source = f"{u_col}/{v_col}"
+            axis_lon_used = float(axis_lon_dynamic)
     mirrored = adapter.mirror_lon_about(
         frame,
-        lon0=lon0,
+        lon0=axis_lon_used,
         max_lon_distance=max_lon_distance,
         scalar_cols=scalar_cols,
     )
@@ -235,6 +302,13 @@ def _process_one_time(
         }
 
     with_parity = adapter.add_parity_channels(mirrored)
+    with_parity["axis_mode"] = str(axis_mode)
+    with_parity["axis_lon_static"] = float(axis_lon_static)
+    with_parity["axis_lon_dynamic"] = float(axis_lon_dynamic)
+    with_parity["axis_lon_used"] = float(axis_lon_used)
+    with_parity["steering_source"] = str(steering_source)
+    with_parity["steering_u_mean"] = float(steering_u_mean) if np.isfinite(steering_u_mean) else np.nan
+    with_parity["steering_v_mean"] = float(steering_v_mean) if np.isfinite(steering_v_mean) else np.nan
     with_parity["lead_partition"] = with_parity["lead_h_bucket"].apply(_lead_partition_value)
     with_parity["date"] = pd.to_datetime(with_parity["time"]).dt.strftime("%Y-%m-%d")
 
@@ -269,6 +343,13 @@ def _process_one_time(
         "speed_l",
         "speed_r",
         "eta_parity",
+        "axis_mode",
+        "axis_lon_static",
+        "axis_lon_dynamic",
+        "axis_lon_used",
+        "steering_source",
+        "steering_u_mean",
+        "steering_v_mean",
         "_mirror_lon",
         "_mirror_lon_dist",
     ] + [c for c in scalar_cols if c in with_parity.columns] + [
@@ -289,6 +370,13 @@ def _process_one_time(
         "rows_dropped_post_parity": int(max(0, snap_guard_rows - written_rows)),
         "snap_distances": dist_vals.astype(float),
         "scalar_ks": scalar_ks,
+        "axis_mode": str(axis_mode),
+        "axis_lon_static": float(axis_lon_static),
+        "axis_lon_dynamic": float(axis_lon_dynamic),
+        "axis_lon_used": float(axis_lon_used),
+        "steering_source": str(steering_source),
+        "steering_u_mean": float(steering_u_mean) if np.isfinite(steering_u_mean) else None,
+        "steering_v_mean": float(steering_v_mean) if np.isfinite(steering_v_mean) else None,
     }
     return out, audit
 
@@ -331,6 +419,24 @@ def _lead_partition_value(value: Any) -> str:
     if abs(fv - round(fv)) < 1e-6:
         return str(int(round(fv)))
     return str(fv)
+
+
+def compute_steering_axis_lon(
+    u850: float,
+    v850: float,
+    lat_center: float,
+    lon_center: float,
+    radius_deg: float = 5.0,
+    calm_threshold_ms: float = 0.5,
+) -> float:
+    """Compute longitude of mirror axis perpendicular to steering flow."""
+
+    wspd = float(np.hypot(float(u850), float(v850)))
+    if not np.isfinite(wspd) or wspd < float(calm_threshold_ms):
+        return float(lon_center)
+    cos_lat = max(float(np.cos(np.radians(float(lat_center)))), 0.05)
+    delta_lon = float(radius_deg) * (-float(v850) / wspd) / cos_lat
+    return float(lon_center + delta_lon)
 
 
 def _init_mirror_audit(scalar_cols: list[str]) -> dict[str, Any]:

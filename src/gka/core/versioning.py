@@ -1,6 +1,7 @@
 """Version and environment helpers."""
 
 from __future__ import annotations
+import logging
 
 import importlib.metadata
 import subprocess
@@ -24,7 +25,8 @@ def git_commit_hash(cwd: str | Path) -> str | None:
             text=True,
         ).strip()
         return out
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Failed to get git commit hash: {e}")
         return None
 
 

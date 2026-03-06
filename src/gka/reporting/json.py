@@ -67,6 +67,6 @@ def _coerce_scalars(values: dict[str, Any]) -> dict[str, Any]:
             continue
         try:
             out[key] = float(value)
-        except Exception:
+        except (ValueError, TypeError):
             out[key] = str(value)
     return out

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from gka.utils.coerce import as_float, as_bool
 import argparse
 import json
 from pathlib import Path
@@ -35,7 +36,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
     payload = _build_audit_payload(row, metadata)
-    if bool(args.json):
+    if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
@@ -66,15 +67,15 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
-def _as_float(row: pd.Series, key: str, default: float = float("nan")) -> float:
+def as_float(row: pd.Series, key: str, default: float = float("nan")) -> float:
     try:
         v = float(row.get(key, default))
         return v
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
-def _as_bool(row: pd.Series, key: str, default: bool = False) -> bool:
+def as_bool(row: pd.Series, key: str, default: bool = False) -> bool:
     v = row.get(key, default)
     if isinstance(v, bool):
         return v
@@ -86,8 +87,8 @@ def _as_bool(row: pd.Series, key: str, default: bool = False) -> bool:
 def _build_audit_payload(row: pd.Series, metadata: dict[str, Any]) -> dict[str, Any]:
     rejected = str(row.get("knee_rejected_because", "") or "")
     reasons = [r for r in rejected.split(";") if r]
-    knee_detected = _as_bool(row, "knee_detected", False)
-    parity_pass = _as_bool(row, "parity_signal_pass", False)
+    knee_detected = as_bool(row, "knee_detected", False)
+    parity_pass = as_bool(row, "parity_signal_pass", False)
 
     return {
         "dataset_path": metadata.get("dataset_path"),
@@ -95,26 +96,26 @@ def _build_audit_payload(row: pd.Series, metadata: dict[str, Any]) -> dict[str, 
         "timestamp_utc": metadata.get("timestamp_utc"),
         "knee": {
             "decision": "accepted" if knee_detected else "rejected",
-            "confidence": _as_float(row, "knee_confidence", 0.0),
-            "delta_bic": _as_float(row, "knee_delta_bic", float("nan")),
-            "L_k": _as_float(row, "L_k", float("nan")),
+            "confidence": as_float(row, "knee_confidence", 0.0),
+            "delta_bic": as_float(row, "knee_delta_bic", float("nan")),
+            "L_k": as_float(row, "L_k", float("nan")),
             "reasons": reasons,
         },
         "parity": {
             "decision": "odd" if parity_pass else "null",
-            "mirror_stat": _as_float(row, "parity_mirror_stat", float("nan")),
-            "p_perm": _as_float(row, "parity_p_perm", 1.0),
-            "p_dir": _as_float(row, "parity_p_dir", 1.0),
-            "P_lock": _as_float(row, "P_lock", float("nan")),
+            "mirror_stat": as_float(row, "parity_mirror_stat", float("nan")),
+            "p_perm": as_float(row, "parity_p_perm", 1.0),
+            "p_dir": as_float(row, "parity_p_dir", 1.0),
+            "P_lock": as_float(row, "P_lock", float("nan")),
         },
         "stability": {
-            "gamma": _as_float(row, "gamma", float("nan")),
-            "Delta_b": _as_float(row, "Delta_hat", float("nan")),
-            "S_at_mu_k": _as_float(row, "S_at_mu_k", float("nan")),
-            "W_mu": _as_float(row, "W_mu", float("nan")),
+            "gamma": as_float(row, "gamma", float("nan")),
+            "Delta_b": as_float(row, "Delta_hat", float("nan")),
+            "S_at_mu_k": as_float(row, "S_at_mu_k", float("nan")),
+            "W_mu": as_float(row, "W_mu", float("nan")),
             "band_class": str(row.get("band_class_hat", "unknown")),
             "class": str(row.get("stability_class", "unknown")),
             "eigen_band": str(row.get("eigen_band", "unknown")),
-            "stability_margin": _as_float(row, "stability_margin", float("nan")),
+            "stability_margin": as_float(row, "stability_margin", float("nan")),
         },
     }

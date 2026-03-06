@@ -21,6 +21,62 @@ class CoverageContract:
     min_far_per_lead: int = 0
 
 
+@dataclass(frozen=True)
+class ParityCalibrationContract:
+    event_min_floor: float = 0.05
+    far_rate_cap: float = 0.35
+    margin_floor: float = 0.15
+
+
+def parity_calibration_safety_ok(
+    *,
+    event_rate: float,
+    far_rate: float,
+    contract: ParityCalibrationContract,
+) -> bool:
+    er = float(event_rate)
+    fr = float(far_rate)
+    margin = float(er - fr)
+    return (
+        er >= float(contract.event_min_floor)
+        and fr <= float(contract.far_rate_cap)
+        and margin >= float(contract.margin_floor)
+        and er >= fr
+    )
+
+
+
+def _get_column_preferences(basis: str, use_flags: bool) -> tuple[tuple[str, ...], tuple[str, ...], str, str]:
+    """Get column preferences based on time basis and use_flags."""
+    if basis == TimeBasis.SOURCE.value:
+        if use_flags:
+            event_pref = ("ib_event_strict_source", "ib_event_source", "ib_event_strict", "ib_event")
+            far_pref = ("ib_far_strict_source", "ib_far_source", "ib_far_strict", "ib_far")
+        else:
+            event_pref = ("ib_event_source", "ib_event", "ib_event_strict_source", "ib_event_strict")
+            far_pref = ("ib_far_source", "ib_far", "ib_far_strict_source", "ib_far_strict")
+        min_any_col = "ib_min_dist_any_storm_km_source"
+        nearest_col = "nearest_storm_distance_km_source"
+    elif basis == TimeBasis.VALID.value:
+        if use_flags:
+            event_pref = ("ib_event_strict_valid", "ib_event_valid", "ib_event_strict", "ib_event")
+            far_pref = ("ib_far_strict_valid", "ib_far_valid", "ib_far_strict", "ib_far")
+        else:
+            event_pref = ("ib_event_valid", "ib_event", "ib_event_strict_valid", "ib_event_strict")
+            far_pref = ("ib_far_valid", "ib_far", "ib_far_strict_valid", "ib_far_strict")
+        min_any_col = "ib_min_dist_any_storm_km_valid"
+        nearest_col = "nearest_storm_distance_km_valid"
+    else:
+        if use_flags:
+            event_pref = ("ib_event_strict", "ib_event", "ib_event_strict_max", "ib_event_max")
+            far_pref = ("ib_far_strict", "ib_far", "ib_far_strict_max", "ib_far_max")
+        else:
+            event_pref = ("ib_event", "ib_event_strict", "ib_event_max", "ib_event_strict_max")
+            far_pref = ("ib_far", "ib_far_strict", "ib_far_max", "ib_far_strict_max")
+        min_any_col = "ib_min_dist_any_storm_km"
+        nearest_col = "nearest_storm_distance_km"
+    return event_pref, far_pref, min_any_col, nearest_col
+
 def strict_ib_case_flags(
     *,
     samples: pd.DataFrame,
@@ -44,33 +100,7 @@ def strict_ib_case_flags(
         sub["ib_far_quality_tag"] = "missing"
     sub["ib_far_quality_tag"] = sub["ib_far_quality_tag"].fillna("missing").astype(str)
 
-    if basis == TimeBasis.SOURCE.value:
-        if bool(use_flags):
-            event_pref = ("ib_event_strict_source", "ib_event_source", "ib_event_strict", "ib_event")
-            far_pref = ("ib_far_strict_source", "ib_far_source", "ib_far_strict", "ib_far")
-        else:
-            event_pref = ("ib_event_source", "ib_event", "ib_event_strict_source", "ib_event_strict")
-            far_pref = ("ib_far_source", "ib_far", "ib_far_strict_source", "ib_far_strict")
-        min_any_col = "ib_min_dist_any_storm_km_source"
-        nearest_col = "nearest_storm_distance_km_source"
-    elif basis == TimeBasis.VALID.value:
-        if bool(use_flags):
-            event_pref = ("ib_event_strict_valid", "ib_event_valid", "ib_event_strict", "ib_event")
-            far_pref = ("ib_far_strict_valid", "ib_far_valid", "ib_far_strict", "ib_far")
-        else:
-            event_pref = ("ib_event_valid", "ib_event", "ib_event_strict_valid", "ib_event_strict")
-            far_pref = ("ib_far_valid", "ib_far", "ib_far_strict_valid", "ib_far_strict")
-        min_any_col = "ib_min_dist_any_storm_km_valid"
-        nearest_col = "nearest_storm_distance_km_valid"
-    else:
-        if bool(use_flags):
-            event_pref = ("ib_event_strict", "ib_event", "ib_event_strict_max", "ib_event_max")
-            far_pref = ("ib_far_strict", "ib_far", "ib_far_strict_max", "ib_far_max")
-        else:
-            event_pref = ("ib_event", "ib_event_strict", "ib_event_max", "ib_event_strict_max")
-            far_pref = ("ib_far", "ib_far_strict", "ib_far_max", "ib_far_strict_max")
-        min_any_col = "ib_min_dist_any_storm_km"
-        nearest_col = "nearest_storm_distance_km"
+    event_pref, far_pref, min_any_col, nearest_col = _get_column_preferences(basis, use_flags)
 
     def _first_present(pref: tuple[str, ...]) -> str | None:
         for c in pref:

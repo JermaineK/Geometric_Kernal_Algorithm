@@ -1,6 +1,7 @@
 """Adapter registry for domain-agnostic pipeline execution."""
 
 from __future__ import annotations
+import logging
 
 from importlib import import_module
 from importlib.metadata import EntryPoint, entry_points
@@ -50,7 +51,8 @@ def _load_entrypoint_adapters() -> None:
 def _load_entrypoint(ep: EntryPoint | Any) -> None:
     try:
         obj = ep.load()
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Failed to load entrypoint: {e}")
         return
     if callable(obj):
         inst = obj()

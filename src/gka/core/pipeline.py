@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+logger = logging.getLogger(__name__)
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -128,6 +130,35 @@ def run_pipeline(
 
     return PipelineResult(summary=results_df, null_summary=null_summary_df, metadata=metadata)
 
+
+
+def _compute_impedance_stage(
+    imp_in,
+    l_for_imp: float,
+    per_size: pd.DataFrame,
+    ticks,
+    cfg: dict,
+) -> tuple:
+    """Compute impedance alignment and related metrics."""
+    omega_k = _median_or_none(imp_in.omega_k)
+    if omega_k is None and ticks.Omega_candidates.size > 0:
+        omega_k = float(ticks.Omega_candidates[0])
+    
+    imp = impedance_alignment(
+        omega_k=omega_k,
+        L=l_for_imp,
+        cm_or_v=imp_in.cm_or_v,
+        a=imp_in.a_or_L,
+        tolerance=float(cfg["impedance"].get("tolerance", 0.1)),
+    )
+    
+    c_m_hat = _median_or_none(imp_in.cm_or_v)
+    if c_m_hat is None and omega_k is not None and l_for_imp is not None and l_for_imp > 0:
+        c_m_hat = float((omega_k * l_for_imp) / (2.0 * np.pi))
+    
+    tau_s_hat = None if omega_k is None or omega_k <= 0 else float(1.0 / omega_k)
+    
+    return imp, omega_k, c_m_hat, tau_s_hat
 
 def _run_core(
     bundle: DatasetBundle,
@@ -645,7 +676,8 @@ def _run_nulls(
             gamma = float(result_df["gamma"].iloc[0])
             L_k = float(result_df["L_k"].iloc[0])
             eta_mean = float(result_df["eta"].mean())
-        except Exception:
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            logger.warning(f"Failed to extract gamma/L_k/eta from null model results: {e}")
             gamma = float("nan")
             L_k = float("nan")
             eta_mean = float("nan")

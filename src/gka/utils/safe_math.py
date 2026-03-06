@@ -10,7 +10,7 @@ def safe_log(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return np.log(np.clip(arr, eps, None))
 
 
-def safe_div(num: np.ndarray | float, den: np.ndarray | float, eps: float = 1e-12):
+def safe_div(num: np.ndarray | float, den: np.ndarray | float, eps: float = 1e-12) -> np.ndarray:
     den_arr = np.asarray(den, dtype=float)
     return np.asarray(num, dtype=float) / np.where(np.abs(den_arr) < eps, eps, den_arr)
 

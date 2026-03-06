@@ -49,5 +49,5 @@ def write_report_md(payload: dict[str, Any], out_path: str | Path) -> None:
 def _fmt(v: Any) -> str:
     try:
         return f"{float(v):.6g}"
-    except Exception:
+    except (ValueError, TypeError):
         return str(v)

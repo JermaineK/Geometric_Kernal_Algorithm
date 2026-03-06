@@ -4,7 +4,10 @@ import argparse
 import hashlib
 import json
 import subprocess
+import sys
 import tempfile
+import time
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,6 +20,8 @@ from scipy.stats import kendalltau, ks_2samp
 from gka.core.pipeline import run_pipeline
 from gka.domains import register_builtin_adapters
 from gka.weather.contract import (
+    ParityCalibrationContract,
+    parity_calibration_safety_ok as contract_parity_calibration_safety_ok,
     strict_coverage_ok as contract_strict_coverage_ok,
     strict_ib_case_flags as contract_strict_ib_case_flags,
     strict_ib_coverage as contract_strict_ib_coverage,
@@ -24,6 +29,61 @@ from gka.weather.contract import (
 from gka.utils.time import utc_now_iso
 
 NullTransform = Callable[[pd.DataFrame, np.random.Generator], pd.DataFrame]
+
+
+def _safe_nanmean(values: Any, default: float = 0.0) -> float:
+    try:
+        arr = np.asarray(values, dtype=float)
+    except Exception:
+        return float(default)
+    if arr.size == 0:
+        return float(default)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float(default)
+    return float(np.mean(finite))
+
+
+def _safe_nanmedian(values: Any, default: float = 0.0) -> float:
+    try:
+        arr = np.asarray(values, dtype=float)
+    except Exception:
+        return float(default)
+    if arr.size == 0:
+        return float(default)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float(default)
+    return float(np.median(finite))
+
+
+def _format_elapsed(elapsed_sec: float) -> str:
+    sec = max(0, int(round(float(elapsed_sec))))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _render_progress(*, current: int, total: int, label: str, started_at: float, width: int = 28) -> None:
+    total_i = max(1, int(total))
+    curr_i = max(0, min(int(current), total_i))
+    frac = float(curr_i) / float(total_i)
+    filled = int(round(frac * float(max(8, int(width)))))
+    bar = "#" * filled + "-" * (max(8, int(width)) - filled)
+    elapsed = _format_elapsed(time.perf_counter() - float(started_at))
+    msg = f"\r[{bar}] {curr_i:>4}/{total_i:<4} {frac*100:5.1f}%  {label}  elapsed {elapsed}"
+    print(msg, end="", file=sys.stderr, flush=True)
+    if curr_i >= total_i:
+        print("", file=sys.stderr, flush=True)
+
+
+def _progress_stage(enabled: bool, message: str) -> None:
+    if not bool(enabled):
+        return
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {message}", file=sys.stderr, flush=True)
 
 MODE_TO_COLUMN: dict[str, str | None] = {
     "current": None,
@@ -74,6 +134,24 @@ def parse_args() -> argparse.Namespace:
         help="Optional storm identity column for leakage audit (default: auto-detect)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show progress bars for long-running case evaluation loops",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=25,
+        help="Progress update cadence in number of cases",
+    )
+    parser.add_argument(
+        "--suppress-runtime-warnings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Suppress noisy numeric runtime warnings from empty/degenerate slices",
+    )
     parser.add_argument("--p-lock-threshold", type=float, default=0.5, help="Parity-lock threshold")
     parser.add_argument(
         "--enable-time-frequency-knee",
@@ -426,8 +504,8 @@ def parse_args() -> argparse.Namespace:
         default=[
             "theta_roll",
             "center_swap",
-            "storm_track_reassignment",
-            "time_permutation_within_lead",
+            "storm_track_reassignment_phase_matched",
+            "time_permutation_within_track_phase",
             "theta_scramble_within_ring",
         ],
         help="Geometry null checks required by the collapse gate",
@@ -533,10 +611,47 @@ def parse_args() -> argparse.Namespace:
         help="Calibrate storm-local parity thresholds on train split and freeze for test evaluation",
     )
     parser.add_argument(
+        "--no-calibrate-parity-thresholds",
+        dest="calibrate_parity_thresholds",
+        action="store_false",
+        help="Disable parity-threshold calibration and use configured thresholds directly.",
+    )
+    parser.set_defaults(calibrate_parity_thresholds=False)
+    parser.add_argument(
         "--parity-calibration-event-min-floor",
         type=float,
         default=0.05,
         help="Minimum train event parity rate allowed for calibrated thresholds; lower-rate solutions are rejected.",
+    )
+    parser.add_argument(
+        "--parity-calibration-far-rate-cap",
+        type=float,
+        default=0.35,
+        help="Maximum train far parity rate allowed for calibrated thresholds.",
+    )
+    parser.add_argument(
+        "--parity-calibration-margin-floor",
+        type=float,
+        default=0.15,
+        help="Minimum train event-minus-far margin required for calibrated thresholds.",
+    )
+    parser.add_argument(
+        "--min-calib-event-cases",
+        type=int,
+        default=10,
+        help="Minimum strict event cases required in calibration-train cohorts; calibration skips below this.",
+    )
+    parser.add_argument(
+        "--min-calib-far-cases",
+        type=int,
+        default=20,
+        help="Minimum strict far cases required in calibration-train cohorts; calibration skips below this.",
+    )
+    parser.add_argument(
+        "--calib-skip-default-threshold",
+        type=float,
+        default=0.5,
+        help="Default fallback threshold metadata recorded when calibration is skipped for small cohorts.",
     )
     parser.add_argument(
         "--parity-calibration-constrain-min-thresholds",
@@ -596,6 +711,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.35,
         help="Relative tolerance on knee L consistency across modes for weather acceptance",
+    )
+    parser.add_argument(
+        "--band-trajectory-min-length",
+        type=int,
+        default=4,
+        help="Minimum slices per storm required for band-trajectory scoring",
+    )
+    parser.add_argument(
+        "--band-trajectory-soft-pass-rate",
+        type=float,
+        default=0.40,
+        help="Soft-pass threshold for trajectory_rate in band-trajectory diagnostic",
     )
     return parser.parse_args()
 
@@ -847,6 +974,12 @@ def _select_case_subset(
 
 def main() -> int:
     args = parse_args()
+    if bool(getattr(args, "suppress_runtime_warnings", True)):
+        # Frequent in sparse/degenerate cohorts; avoids log flood and console I/O slowdown.
+        warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
+        warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide", category=RuntimeWarning)
+        warnings.filterwarnings("ignore", message="invalid value encountered in sqrt", category=RuntimeWarning)
+        warnings.filterwarnings("ignore", message="All `x` coordinates are identical.", category=RuntimeWarning)
     register_builtin_adapters()
     dataset_dir = Path(args.dataset)
     config_path = Path(args.config)
@@ -856,6 +989,7 @@ def main() -> int:
     if not config_path.exists():
         raise FileNotFoundError(f"Config path not found: {config_path}")
 
+    _progress_stage(bool(args.progress), "loading samples.parquet")
     samples_all = pd.read_parquet(dataset_dir / "samples.parquet")
     samples_all["t"] = pd.to_datetime(samples_all["t"], errors="coerce")
     if "onset_time" in samples_all.columns:
@@ -1020,6 +1154,7 @@ def main() -> int:
     strict_cov_reasons = [f"test:{v}" for v in strict_test_reasons] + [f"train:{v}" for v in strict_train_reasons]
     if not bool(strict_cov_ok):
         raise ValueError("insufficient_strict_ib_coverage:" + ";".join([str(v) for v in strict_cov_reasons]))
+    _progress_stage(bool(args.progress), "strict coverage gate passed; evaluating train/test cases")
     train_df = samples.loc[samples["case_id"].astype(str).isin(train_cases)].copy()
     test_df = samples.loc[samples["case_id"].astype(str).isin(test_cases)].copy()
     axis_meta = _load_axis_robust_meta(
@@ -1038,6 +1173,9 @@ def main() -> int:
         parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
         parity_tangential_radial_min=float(args.parity_tangential_radial_min),
         parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
+        show_progress=bool(args.progress),
+        progress_label="evaluate train",
+        progress_every=int(args.progress_every),
     )
     test_case_metrics = _evaluate_cases(
         test_df,
@@ -1049,6 +1187,9 @@ def main() -> int:
         parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
         parity_tangential_radial_min=float(args.parity_tangential_radial_min),
         parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
+        show_progress=bool(args.progress),
+        progress_label="evaluate test",
+        progress_every=int(args.progress_every),
     )
     train_case_metrics = _apply_axis_robust_gating(train_case_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
     test_case_metrics = _apply_axis_robust_gating(test_case_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
@@ -1159,25 +1300,34 @@ def main() -> int:
     }
     summary["test"]["knee_hit_rate_pre_onset_storm"] = summary["test"].get("storm", {}).get("knee_rate", 0.0)
     summary["test"]["false_knee_rate_controls"] = summary["test"].get("control", {}).get("knee_rate", 0.0)
+    summary["band_trajectory"] = _compute_band_trajectory_score(
+        test_case_metrics,
+        min_trajectory_length=int(args.band_trajectory_min_length),
+    )
+    bt = summary["band_trajectory"]
+    summary["band_trajectory_soft_pass"] = bool(
+        bt.get("available", False) and float(bt.get("trajectory_rate", 0.0)) >= float(args.band_trajectory_soft_pass_rate)
+    )
 
     null_transforms: dict[str, NullTransform] = {
         "direction_randomization": _direction_randomization,
         "spatial_shuffle": _spatial_shuffle_control,
         "time_permutation_within_lead": _time_permutation_within_lead,
-        "time_permutation_within_track_phase": _time_permutation_within_lead,
+        "time_permutation_within_track_phase": _time_permutation_within_track_phase,
         "lat_band_shuffle_within_month_hour": _lat_band_shuffle_within_month_hour,
         "fake_mirror_pairing": _fake_mirror_pairing,
         "latitude_mirror_pairing": _latitude_mirror_pairing,
         "circular_lon_shift_pairing": _circular_lon_shift_pairing,
         "theta_roll": _theta_roll_polar,
         "theta_scramble_within_ring": _theta_scramble_within_ring,
+        "ring_label_scramble": _ring_label_scramble,
         "radial_shuffle": _radial_shuffle_polar,
         "radial_scramble": _radial_scramble_polar,
         "mirror_axis_jitter": _mirror_axis_jitter,
         "center_jitter": _center_jitter_polar,
         "center_swap": _center_swap_polar,
         "storm_track_reassignment": _storm_track_reassignment,
-        "storm_track_reassignment_phase_matched": _storm_track_reassignment,
+        "storm_track_reassignment_phase_matched": _storm_track_reassignment_phase_matched,
     }
     requested_nulls = {
         str(v).strip()
@@ -1191,6 +1341,7 @@ def main() -> int:
     null_case_metrics: dict[str, pd.DataFrame] = {}
     null_strata: dict[str, dict[str, Any]] = {}
     for i, (name, transform) in enumerate(null_transforms.items()):
+        _progress_stage(bool(args.progress), f"null {i+1}/{len(null_transforms)}: {name} (transform + pipeline)")
         transformed = transform(test_df, rng=np.random.default_rng(int(args.seed) + 101 + i))
         null_controls[name] = _run_partition_pipeline(
             transformed,
@@ -1198,6 +1349,7 @@ def main() -> int:
             config_path=config_path,
             seed=int(args.seed) + 201 + i,
         )
+        _progress_stage(bool(args.progress), f"null {i+1}/{len(null_transforms)}: {name} (case metrics)")
         metrics = _evaluate_cases(
             transformed,
             dataset_dir=dataset_dir,
@@ -1208,6 +1360,9 @@ def main() -> int:
             parity_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
             parity_tangential_radial_min=float(args.parity_tangential_radial_min),
             parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
+            show_progress=bool(args.progress),
+            progress_label=f"null:{name}",
+            progress_every=int(args.progress_every),
         )
         metrics = _apply_axis_robust_gating(metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
         null_case_metrics[name] = metrics
@@ -1486,6 +1641,7 @@ def main() -> int:
     }
     parity_feature_distributions = _parity_feature_distribution_table(pd.DataFrame())
     if bool(args.calibrate_parity_thresholds):
+        _progress_stage(bool(args.progress), "calibration: evaluate strict train cohorts")
         calib_train_metrics = _evaluate_cases(
             claim_train_df,
             dataset_dir=dataset_dir,
@@ -1496,6 +1652,9 @@ def main() -> int:
             parity_odd_inner_outer_min=0.0,
             parity_tangential_radial_min=0.0,
             parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
+            show_progress=bool(args.progress),
+            progress_label="calibration train",
+            progress_every=int(args.progress_every),
         )
         calib_train_metrics = _apply_axis_robust_gating(
             calib_train_metrics, axis_robust=bool(axis_meta.get("axis_robust", False))
@@ -1512,27 +1671,70 @@ def main() -> int:
             strict_far_min_nearest_storm_km=float(args.strict_far_min_nearest_storm_km),
         )
         parity_feature_distributions = _parity_feature_distribution_table(calib_train_metrics)
-        calib = _calibrate_parity_thresholds_from_train(
-            train_case_metrics=calib_train_metrics,
-            default_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
-            default_tangential_radial_min=float(args.parity_tangential_radial_min),
-            event_min_floor=float(args.parity_calibration_event_min_floor),
-            constrain_min_thresholds=bool(args.parity_calibration_constrain_min_thresholds),
+        calib_cohorts = strict_claim_cohorts.get("calibration_train", {}) or {}
+        n_calib_event = int(calib_cohorts.get("n_cases_event", 0) or 0)
+        n_calib_far = int(calib_cohorts.get("n_cases_far", 0) or 0)
+        calib_gate_pass = bool(
+            (n_calib_event >= int(args.min_calib_event_cases))
+            and (n_calib_far >= int(args.min_calib_far_cases))
         )
-        parity_threshold_calibration = {
-            **calib,
-            "enabled": True,
-            "inner_ring_quantile": float(args.parity_inner_ring_quantile),
-            "strict_train_cohorts": strict_claim_cohorts.get("calibration_train", {}),
-        }
-        if bool(calib.get("available", False)):
-            thr = calib.get("thresholds", {}) or {}
-            parity_thresholds_applied["odd_inner_outer_min"] = float(
-                _to_float(thr.get("odd_inner_outer_min")) or parity_thresholds_applied["odd_inner_outer_min"]
+        if not calib_gate_pass:
+            parity_threshold_calibration = {
+                "enabled": True,
+                "available": False,
+                "status": "skipped_small_cohort",
+                "reason": (
+                    "calibration train cohort too small: "
+                    f"event={n_calib_event} (min={int(args.min_calib_event_cases)}), "
+                    f"far={n_calib_far} (min={int(args.min_calib_far_cases)})"
+                ),
+                "n_cases_event": int(n_calib_event),
+                "n_cases_far": int(n_calib_far),
+                "min_cases_event": int(args.min_calib_event_cases),
+                "min_cases_far": int(args.min_calib_far_cases),
+                "threshold_used": float(args.calib_skip_default_threshold),
+                "calibration_applied": False,
+                "thresholds": dict(parity_thresholds_applied),
+                "inner_ring_quantile": float(args.parity_inner_ring_quantile),
+                "strict_train_cohorts": calib_cohorts,
+            }
+            _progress_stage(
+                bool(args.progress),
+                (
+                    f"calibration skipped: event={n_calib_event}/{int(args.min_calib_event_cases)} "
+                    f"far={n_calib_far}/{int(args.min_calib_far_cases)}"
+                ),
             )
-            parity_thresholds_applied["tangential_radial_min"] = float(
-                _to_float(thr.get("tangential_radial_min")) or parity_thresholds_applied["tangential_radial_min"]
+        else:
+            calib = _calibrate_parity_thresholds_from_train(
+                train_case_metrics=calib_train_metrics,
+                default_odd_inner_outer_min=float(args.parity_odd_inner_outer_min),
+                default_tangential_radial_min=float(args.parity_tangential_radial_min),
+                event_min_floor=float(args.parity_calibration_event_min_floor),
+                far_rate_cap=float(args.parity_calibration_far_rate_cap),
+                margin_floor=float(args.parity_calibration_margin_floor),
+                constrain_min_thresholds=bool(args.parity_calibration_constrain_min_thresholds),
             )
+            parity_threshold_calibration = {
+                **calib,
+                "enabled": True,
+                "inner_ring_quantile": float(args.parity_inner_ring_quantile),
+                "strict_train_cohorts": calib_cohorts,
+                "n_cases_event": int(n_calib_event),
+                "n_cases_far": int(n_calib_far),
+                "min_cases_event": int(args.min_calib_event_cases),
+                "min_cases_far": int(args.min_calib_far_cases),
+                "threshold_used": float(args.calib_skip_default_threshold),
+                "calibration_applied": bool(calib.get("available", False)),
+            }
+            if bool(calib.get("available", False)):
+                thr = calib.get("thresholds", {}) or {}
+                parity_thresholds_applied["odd_inner_outer_min"] = float(
+                    _to_float(thr.get("odd_inner_outer_min")) or parity_thresholds_applied["odd_inner_outer_min"]
+                )
+                parity_thresholds_applied["tangential_radial_min"] = float(
+                    _to_float(thr.get("tangential_radial_min")) or parity_thresholds_applied["tangential_radial_min"]
+                )
 
     claim_retention_train_stages["after_case_reduction_calibration"] = {
         **(strict_claim_cohorts.get("calibration_train", {}) or {}),
@@ -1545,6 +1747,7 @@ def main() -> int:
     summary["claim_strict_cohorts"] = strict_claim_cohorts
     summary["parity_threshold_calibration"] = parity_threshold_calibration
     summary["parity_thresholds_applied"] = parity_thresholds_applied
+    _progress_stage(bool(args.progress), "claim metrics: train")
     claim_train_metrics = _evaluate_cases(
         claim_train_df,
         dataset_dir=dataset_dir,
@@ -1557,7 +1760,11 @@ def main() -> int:
         parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
         alignment_eta_threshold=float(args.alignment_eta_threshold),
         alignment_block_hours=float(args.alignment_block_hours),
+        show_progress=bool(args.progress),
+        progress_label="claim train",
+        progress_every=int(args.progress_every),
     )
+    _progress_stage(bool(args.progress), "claim metrics: test")
     claim_test_metrics = _evaluate_cases(
         claim_test_df,
         dataset_dir=dataset_dir,
@@ -1570,6 +1777,9 @@ def main() -> int:
         parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
         alignment_eta_threshold=float(args.alignment_eta_threshold),
         alignment_block_hours=float(args.alignment_block_hours),
+        show_progress=bool(args.progress),
+        progress_label="claim test",
+        progress_every=int(args.progress_every),
     )
     claim_train_metrics = _apply_axis_robust_gating(claim_train_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
     claim_test_metrics = _apply_axis_robust_gating(claim_test_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
@@ -1620,7 +1830,9 @@ def main() -> int:
         "calibration_train_far_cases": int(calib_far),
     }
     if claim_path_starvation:
-        summary["parity_threshold_calibration"]["reason"] = "claim_path_event_starvation"
+        curr_reason = str((summary.get("parity_threshold_calibration", {}) or {}).get("reason", ""))
+        if curr_reason != "skipped_small_cohort":
+            summary["parity_threshold_calibration"]["reason"] = "claim_path_event_starvation"
         summary["parity_threshold_calibration"]["available"] = bool(
             summary["parity_threshold_calibration"].get("available", False)
         )
@@ -1652,6 +1864,14 @@ def main() -> int:
             "test": _build_knee_trace(claim_test_metrics),
         },
     }
+    summary["claim"]["band_trajectory"] = _compute_band_trajectory_score(
+        claim_test_metrics,
+        min_trajectory_length=int(args.band_trajectory_min_length),
+    )
+    claim_bt = summary["claim"]["band_trajectory"]
+    summary["claim"]["band_trajectory_soft_pass"] = bool(
+        claim_bt.get("available", False) and float(claim_bt.get("trajectory_rate", 0.0)) >= float(args.band_trajectory_soft_pass_rate)
+    )
 
     parity_confound_gate = _build_parity_confound_gate(
         strata_test=claim_strata.get("test", {}),
@@ -1670,12 +1890,14 @@ def main() -> int:
         "radial_scramble",
         "radial_shuffle",
         "theta_scramble_within_ring",
+        "ring_label_scramble",
     ]
     geometry_null_names = tuple(dict.fromkeys(requested_required_checks + optional_checks))
     geometry_null_names = tuple(name for name in geometry_null_names if name in null_transforms)
     center_swap_distance_stats: dict[str, Any] = {}
     for j, name in enumerate(geometry_null_names):
         transform = null_transforms[name]
+        _progress_stage(bool(args.progress), f"geometry null {j+1}/{len(geometry_null_names)}: {name}")
         transformed_claim = transform(claim_test_df, rng=np.random.default_rng(int(args.seed) + 9600 + j))
         if str(name) == "center_swap":
             dist_vals = pd.to_numeric(transformed_claim.get("center_swap_center_distance_km"), errors="coerce")
@@ -1701,6 +1923,9 @@ def main() -> int:
             parity_inner_ring_quantile=float(args.parity_inner_ring_quantile),
             alignment_eta_threshold=float(args.alignment_eta_threshold),
             alignment_block_hours=float(args.alignment_block_hours),
+            show_progress=bool(args.progress),
+            progress_label=f"geom:{name}",
+            progress_every=int(args.progress_every),
         )
         geom_metrics = _apply_axis_robust_gating(geom_metrics, axis_robust=bool(axis_meta.get("axis_robust", False)))
         geometry_null_strata[name] = _summarize_case_metrics_by_strata(geom_metrics, p_lock_threshold=float(args.p_lock_threshold))
@@ -1718,7 +1943,12 @@ def main() -> int:
         no_signal_max_rate=float(args.null_no_signal_max_rate),
         required_checks=tuple(requested_required_checks)
         if requested_required_checks
-        else ("theta_roll", "center_swap", "storm_track_reassignment", "time_permutation_within_lead"),
+        else (
+            "theta_roll",
+            "center_swap",
+            "storm_track_reassignment_phase_matched",
+            "time_permutation_within_track_phase",
+        ),
         center_swap_distance_stats=center_swap_distance_stats,
     )
     summary["geometry_null_collapse"] = geometry_null_collapse
@@ -2496,7 +2726,12 @@ def _build_geometry_null_collapse_gate(
     min_abs_drop: float,
     rate_key: str = "parity_signal_rate",
     no_signal_max_rate: float = 0.05,
-    required_checks: tuple[str, ...] = ("theta_roll", "center_swap", "storm_track_reassignment", "time_permutation_within_lead"),
+    required_checks: tuple[str, ...] = (
+        "theta_roll",
+        "center_swap",
+        "storm_track_reassignment_phase_matched",
+        "time_permutation_within_track_phase",
+    ),
     center_swap_distance_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     events = (observed_strata or {}).get("events", {}) or {}
@@ -3020,8 +3255,8 @@ def _compute_parity_localization_metrics(
             inner = ov[lv <= q]
             outer = ov[lv > q]
             if inner.size > 0 and outer.size > 0:
-                odd_inner = float(np.nanmedian(inner))
-                odd_outer = float(np.nanmedian(outer))
+                odd_inner = _safe_nanmedian(inner, default=np.nan)
+                odd_outer = _safe_nanmedian(outer, default=np.nan)
                 out["odd_inner"] = odd_inner
                 out["odd_outer"] = odd_outer
                 out["odd_inner_outer_ratio"] = float(odd_inner / max(odd_outer, 1e-9))
@@ -3033,7 +3268,7 @@ def _compute_parity_localization_metrics(
         if np.any(valid):
             ratio = vt[valid] / (vr[valid] + 1e-9)
             if ratio.size > 0:
-                out["tangential_radial_ratio"] = float(np.nanmedian(ratio))
+                out["tangential_radial_ratio"] = _safe_nanmedian(ratio, default=np.nan)
     return out
 
 
@@ -3114,10 +3349,10 @@ def _compute_alignment_metrics(
         n_blocks = int(eta_t["time_block"].nunique(dropna=True))
     out.update(
         {
-            "eventness": float(np.nanmean(event_w)) if event_w.size else 0.0,
-            "farness": float(np.nanmean(far_w)) if far_w.size else 0.0,
-            "A_align": float(np.nanmean(pass_t)) if pass_t.size else 0.0,
-            "S_align": float(np.nanmean(eta_vals)) if eta_vals.size else 0.0,
+            "eventness": _safe_nanmean(event_w, default=0.0),
+            "farness": _safe_nanmean(far_w, default=0.0),
+            "A_align": _safe_nanmean(pass_t, default=0.0),
+            "S_align": _safe_nanmean(eta_vals, default=0.0),
             "A_align_event": _weighted_mean_np(pass_t, event_w),
             "A_align_far": _weighted_mean_np(pass_t, far_w),
             "S_align_event": _weighted_mean_np(eta_vals, event_w),
@@ -3153,15 +3388,22 @@ def _evaluate_cases(
     parity_inner_ring_quantile: float = 0.5,
     alignment_eta_threshold: float = 0.10,
     alignment_block_hours: float = 3.0,
+    show_progress: bool = False,
+    progress_label: str = "evaluate_cases",
+    progress_every: int = 25,
 ) -> pd.DataFrame:
     if samples.empty:
         return pd.DataFrame(
             columns=[
                 "case_id",
                 "case_type",
+                "sid",
+                "storm_id",
                 "center_source",
                 "control_tier",
                 "lead_bucket",
+                "lead_h",
+                "phase",
                 "storm_distance_cohort",
                 "nearest_storm_distance_km",
                 "storm_max",
@@ -3221,12 +3463,17 @@ def _evaluate_cases(
             ]
         )
     out_rows: list[dict[str, Any]] = []
-    for i, (case_id, case_df) in enumerate(samples.groupby("case_id", dropna=False)):
+    n_cases_total = int(samples["case_id"].astype(str).nunique()) if "case_id" in samples.columns else 0
+    started_at = time.perf_counter()
+    step_every = max(1, int(progress_every))
+    if bool(show_progress):
+        _render_progress(current=0, total=max(1, n_cases_total), label=str(progress_label), started_at=started_at)
+    for i, (case_id, case_df) in enumerate(samples.groupby("case_id", dropna=False), start=1):
         result = _run_partition_pipeline(
             case_df,
             template_dataset=dataset_dir,
             config_path=config_path,
-            seed=int(seed + i),
+            seed=int(seed + i - 1),
         )
         tf_metrics = _detect_time_frequency_knee(
             case_df,
@@ -3267,6 +3514,16 @@ def _evaluate_cases(
         case_row = {
                 "case_id": str(case_id),
                 "case_type": str(case_df["case_type"].iloc[0]) if "case_type" in case_df.columns else "unknown",
+                "sid": (
+                    str(case_df["sid"].iloc[0])
+                    if "sid" in case_df.columns and case_df["sid"].notna().any()
+                    else str(case_df.get("storm_id", pd.Series([None])).iloc[0]) if "storm_id" in case_df.columns else None
+                ),
+                "storm_id": (
+                    str(case_df["storm_id"].iloc[0])
+                    if "storm_id" in case_df.columns and case_df["storm_id"].notna().any()
+                    else None
+                ),
                 "center_source": (
                     str(case_df["center_source"].iloc[0])
                     if "center_source" in case_df.columns and case_df["center_source"].notna().any()
@@ -3278,6 +3535,12 @@ def _evaluate_cases(
                     else None
                 ),
                 "lead_bucket": str(case_df["lead_bucket"].iloc[0]) if "lead_bucket" in case_df.columns else None,
+                "lead_h": _to_float(pd.to_numeric(case_df.get("lead_h"), errors="coerce").median()),
+                "phase": (
+                    str(case_df["phase"].dropna().astype(str).value_counts().idxmax())
+                    if "phase" in case_df.columns and case_df["phase"].notna().any()
+                    else None
+                ),
                 "storm_distance_cohort": (
                     str(case_df["storm_distance_cohort"].dropna().astype(str).value_counts().idxmax())
                     if "storm_distance_cohort" in case_df.columns and case_df["storm_distance_cohort"].notna().any()
@@ -3344,6 +3607,8 @@ def _evaluate_cases(
             }
         case_row["split_stratum"] = str(_derive_strata_labels(pd.DataFrame([case_row])).iloc[0])
         out_rows.append(case_row)
+        if bool(show_progress) and (i == 1 or i % step_every == 0 or i >= n_cases_total):
+            _render_progress(current=i, total=max(1, n_cases_total), label=str(progress_label), started_at=started_at)
     return pd.DataFrame(out_rows)
 
 
@@ -3482,6 +3747,79 @@ def _phase_bucket_for_null(df: pd.DataFrame) -> pd.Series:
             out.loc[idx] = labels
         return out
     return pd.Series("unknown", index=df.index, dtype=object)
+
+
+def _track_group_for_null(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=object)
+    for col in ("vortex_track_id", "storm_id", "track_id"):
+        if col in df.columns:
+            s = df[col].fillna("").astype(str).str.strip()
+            if bool((s != "").any()):
+                return s.replace("", "unknown")
+    if "case_id" in df.columns:
+        return df["case_id"].fillna("").astype(str).replace("", "unknown")
+    return pd.Series("unknown", index=df.index, dtype=object)
+
+
+def _time_permutation_within_track_phase(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    if samples.empty:
+        return samples.copy()
+    df = samples.copy()
+    if "lead_bucket" not in df.columns:
+        df["lead_bucket"] = "none"
+    df["_phase_bucket"] = _phase_bucket_for_null(df)
+    df["_track_group"] = _track_group_for_null(df)
+    if "t" in df.columns:
+        ts = pd.to_datetime(df["t"], errors="coerce")
+        df["_local_hour"] = ts.dt.hour.fillna(-1).astype(int).astype(str)
+    else:
+        df["_local_hour"] = "unknown"
+    shuffle_cols = [
+        c
+        for c in (
+            "O",
+            "O_polar_chiral",
+            "O_polar_eta",
+            "O_polar_odd_ratio",
+            "O_polar_left",
+            "O_polar_right",
+            "O_polar_tangential",
+            "O_polar_radial",
+        )
+        if c in df.columns
+    ]
+    if not shuffle_cols:
+        return _time_permutation_within_lead(samples, rng)
+
+    key_sets = [
+        [c for c in ("_track_group", "_phase_bucket", "_local_hour", "lead_bucket", "L", "hand") if c in df.columns],
+        [c for c in ("_track_group", "_phase_bucket", "lead_bucket", "L", "hand") if c in df.columns],
+        [c for c in ("_phase_bucket", "_local_hour", "lead_bucket", "L", "hand") if c in df.columns],
+    ]
+    key_cols = max(key_sets, key=lambda cols: len(cols))
+    changed_rows = 0
+    out: list[pd.DataFrame] = []
+    for _, grp in df.groupby(key_cols, dropna=False):
+        g = grp.copy()
+        if g.shape[0] <= 1:
+            out.append(g)
+            continue
+        perm = rng.permutation(g.index.to_numpy())
+        for col in shuffle_cols:
+            vals = pd.to_numeric(df.loc[perm, col], errors="coerce").to_numpy(dtype=float)
+            if vals.size != g.shape[0]:
+                continue
+            if col == "O":
+                vals = np.where(np.isfinite(vals), np.maximum(vals, 1e-8), vals)
+            g[col] = vals
+        changed_rows += int(g.shape[0])
+        out.append(g)
+    out_df = pd.concat(out, ignore_index=True)
+    out_df = out_df.drop(columns=[c for c in ("_phase_bucket", "_track_group", "_local_hour") if c in out_df.columns], errors="ignore")
+    if changed_rows <= 0:
+        return _time_permutation_within_lead(samples, rng)
+    return out_df
 
 
 def _time_permutation_within_lead(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
@@ -3824,6 +4162,11 @@ def _theta_scramble_within_ring(samples: pd.DataFrame, rng: np.random.Generator)
     return pd.concat(out_frames, ignore_index=True)
 
 
+def _ring_label_scramble(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    """Scramble angular ring labels while preserving radial channel magnitudes."""
+    return _theta_scramble_within_ring(samples, rng)
+
+
 def _radial_shuffle_polar(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
     return _radial_scramble_polar(samples, rng)
 
@@ -4124,7 +4467,13 @@ def _center_swap_polar(samples: pd.DataFrame, rng: np.random.Generator) -> pd.Da
     return out
 
 
-def _storm_track_reassignment(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+def _storm_track_reassignment(
+    samples: pd.DataFrame,
+    rng: np.random.Generator,
+    *,
+    require_phase_match: bool = False,
+    require_lat_band_match: bool = False,
+) -> pd.DataFrame:
     """Break storm-phase alignment while preserving broad climatology strata.
 
     For each event-like case, copy parity-bearing channels from a donor case in the same
@@ -4207,7 +4556,7 @@ def _storm_track_reassignment(samples: pd.DataFrame, rng: np.random.Generator) -
     events = case_meta.loc[case_meta["split_stratum"].isin(["events", "near_storm"])].copy()
     donors_all = case_meta.loc[case_meta["split_stratum"].isin(["events", "near_storm", "far_nonstorm"])].copy()
     if events.empty or donors_all.empty:
-        return _time_permutation_within_lead(samples, rng)
+        return _time_permutation_within_track_phase(samples, rng)
 
     mapping: dict[str, dict[str, Any]] = {}
     for _, ev in events.iterrows():
@@ -4234,6 +4583,26 @@ def _storm_track_reassignment(samples: pd.DataFrame, rng: np.random.Generator) -
             p = donors["phase_bucket"].astype(str) == phase_bucket
             if bool(p.any()):
                 donors = donors.loc[p].copy()
+            elif bool(require_phase_match):
+                continue
+        if bool(require_lat_band_match):
+            ev_lat = _to_float(ev.get("lat0"))
+            if ev_lat is None:
+                continue
+            ev_lat_bin = float(np.floor(float(ev_lat) / 5.0) * 5.0)
+            donors = donors.copy()
+            donors["lat_bin"] = donors["lat0"].map(
+                lambda v: (
+                    np.floor(float(_to_float(v)) / 5.0) * 5.0
+                    if (_to_float(v) is not None and np.isfinite(float(_to_float(v))))
+                    else np.nan
+                )
+            )
+            dmask = np.isfinite(pd.to_numeric(donors["lat_bin"], errors="coerce")) & (pd.to_numeric(donors["lat_bin"], errors="coerce") == ev_lat_bin)
+            if bool(dmask.any()):
+                donors = donors.loc[dmask].copy()
+            else:
+                continue
         if donors.empty:
             continue
         donors = donors.assign(
@@ -4257,7 +4626,7 @@ def _storm_track_reassignment(samples: pd.DataFrame, rng: np.random.Generator) -
         }
 
     if not mapping:
-        return _time_permutation_within_lead(samples, rng)
+        return _time_permutation_within_track_phase(samples, rng)
 
     out = df.copy()
     out["storm_track_reassigned"] = False
@@ -4331,20 +4700,30 @@ def _storm_track_reassignment(samples: pd.DataFrame, rng: np.random.Generator) -
     return out.drop(columns=[c for c in ("_month", "_hour", "_track_group", "_phase_bucket") if c in out.columns], errors="ignore")
 
 
+def _storm_track_reassignment_phase_matched(samples: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    return _storm_track_reassignment(
+        samples=samples,
+        rng=rng,
+        require_phase_match=True,
+        require_lat_band_match=True,
+    )
+
+
 def _geometry_null_transform_by_name(name: str) -> NullTransform | None:
     mapping: dict[str, NullTransform] = {
         "theta_roll": _theta_roll_polar,
         "center_jitter": _center_jitter_polar,
         "center_swap": _center_swap_polar,
         "storm_track_reassignment": _storm_track_reassignment,
-        "storm_track_reassignment_phase_matched": _storm_track_reassignment,
+        "storm_track_reassignment_phase_matched": _storm_track_reassignment_phase_matched,
         "time_permutation_within_lead": _time_permutation_within_lead,
-        "time_permutation_within_track_phase": _time_permutation_within_lead,
+        "time_permutation_within_track_phase": _time_permutation_within_track_phase,
         "lat_band_shuffle_within_month_hour": _lat_band_shuffle_within_month_hour,
         "mirror_axis_jitter": _mirror_axis_jitter,
         "radial_scramble": _radial_scramble_polar,
         "radial_shuffle": _radial_shuffle_polar,
         "theta_scramble_within_ring": _theta_scramble_within_ring,
+        "ring_label_scramble": _ring_label_scramble,
     }
     return mapping.get(str(name))
 
@@ -4401,6 +4780,64 @@ def _summarize_case_metrics_by_strata(case_metrics: pd.DataFrame, p_lock_thresho
         "events": _aggregate_case_metrics(events, p_lock_threshold=p_lock_threshold),
         "near_storm_only": _aggregate_case_metrics(near_only, p_lock_threshold=p_lock_threshold),
         "far_nonstorm": _aggregate_case_metrics(far_nonstorm, p_lock_threshold=p_lock_threshold),
+    }
+
+
+def _compute_band_trajectory_score(
+    case_metrics: pd.DataFrame,
+    min_trajectory_length: int = 4,
+    required_transitions: tuple[str, ...] = ("incoherent", "forbidden_middle", "coherent"),
+) -> dict[str, Any]:
+    if case_metrics is None or case_metrics.empty:
+        return {"available": False, "reason": "empty_case_metrics"}
+    if "lead_h" not in case_metrics.columns:
+        return {"available": False, "reason": "missing_lead_h"}
+    if "band_class_hat" not in case_metrics.columns:
+        return {"available": False, "reason": "missing_band_class_hat"}
+
+    sid_col = None
+    for c in ("sid", "storm_id", "nearest_storm_id"):
+        if c in case_metrics.columns:
+            sid_col = c
+            break
+    if sid_col is None:
+        return {"available": False, "reason": "missing_storm_identity"}
+
+    frame = case_metrics.copy()
+    frame["_sid"] = frame[sid_col].astype(str)
+    frame["lead_h"] = pd.to_numeric(frame["lead_h"], errors="coerce")
+    frame = frame.dropna(subset=["_sid", "lead_h"])
+    if frame.empty:
+        return {"available": False, "reason": "no_valid_sid_lead_pairs"}
+
+    transition = tuple(str(v) for v in required_transitions)
+    per_storm: dict[str, Any] = {}
+    for sid, grp in frame.groupby("_sid", dropna=False):
+        slices = grp.sort_values("lead_h", ascending=False).copy()
+        bands = [str(v) for v in slices["band_class_hat"].dropna().astype(str).tolist() if str(v)]
+        if len(bands) < int(min_trajectory_length):
+            continue
+        try:
+            idxs = [bands.index(lbl) for lbl in transition]
+            has_transition = bool(all(idxs[i] < idxs[i + 1] for i in range(len(idxs) - 1)))
+        except ValueError:
+            has_transition = False
+        per_storm[str(sid)] = {
+            "has_trajectory": bool(has_transition),
+            "n_slices": int(len(bands)),
+            "band_sequence": bands[:8],
+        }
+
+    n_total = int(len(per_storm))
+    n_pos = int(sum(1 for rec in per_storm.values() if bool(rec.get("has_trajectory", False))))
+    return {
+        "available": True,
+        "n_storms_with_slices": int(n_total),
+        "n_trajectory_positive": int(n_pos),
+        "trajectory_rate": float(n_pos / max(n_total, 1)),
+        "required_transitions": list(transition),
+        "min_trajectory_length": int(min_trajectory_length),
+        "per_storm": per_storm,
     }
 
 
@@ -5726,7 +6163,7 @@ def _compute_case_eta_scores(samples: pd.DataFrame) -> pd.DataFrame:
                 "storm_max": int(storm_series.max()),
                 "near_storm_max": int(near_series.max()),
                 "pregen_max": int(pregen_series.max()),
-                "eta_score": float(np.nanmedian(eta)),
+                "eta_score": _safe_nanmedian(eta, default=np.nan),
             }
         )
     return pd.DataFrame(rows)
@@ -5740,11 +6177,17 @@ def _rank_agreement_vs_base(base_rank: pd.DataFrame | None, curr_rank: pd.DataFr
     merged = pd.merge(left, right, on="case_id", how="inner")
     if merged.shape[0] < 3:
         return None
-    tau = kendalltau(
-        pd.to_numeric(merged["eta_base"], errors="coerce"),
-        pd.to_numeric(merged["eta_curr"], errors="coerce"),
-        nan_policy="omit",
-    )
+    eta_base = pd.to_numeric(merged["eta_base"], errors="coerce").to_numpy(dtype=float)
+    eta_curr = pd.to_numeric(merged["eta_curr"], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(eta_base) & np.isfinite(eta_curr)
+    if int(np.sum(valid)) < 3:
+        return None
+    eta_base = eta_base[valid]
+    eta_curr = eta_curr[valid]
+    # Avoid degenerate scipy path (and warnings) when either side is constant.
+    if np.unique(eta_base).size < 2 or np.unique(eta_curr).size < 2:
+        return None
+    tau = kendalltau(eta_base, eta_curr, nan_policy="omit")
     return _to_float(getattr(tau, "correlation", None))
 
 
@@ -5923,8 +6366,9 @@ def _filter_claim_to_strict_far_controls(
     def _apply(df: pd.DataFrame | None) -> tuple[pd.DataFrame | None, dict[str, Any]]:
         if df is None or df.empty:
             return df, {"n_rows": 0, "n_cases_total": 0, "n_cases_kept": 0, "n_cases_dropped_non_strict_far": 0}
-        strata = _derive_strata_labels(df)
-        strict_far = _strict_far_series(df).reindex(df.index, fill_value=False).astype(bool)
+        # Use strict-IB far flags directly so strict events are never removed by legacy strata labels.
+        far_mask = _strict_far_series(df).reindex(df.index, fill_value=False).astype(bool)
+        strict_far = far_mask.copy()
         quality = (
             df.get("ib_far_quality_tag", pd.Series(index=df.index))
             .fillna("missing")
@@ -5935,7 +6379,6 @@ def _filter_claim_to_strict_far_controls(
         allowed = {str(v).strip().lower() for v in (allowed_quality_tags or ()) if str(v).strip()}
         if allowed:
             strict_far = strict_far & quality.isin(allowed)
-        far_mask = strata == "far_nonstorm"
         keep = (~far_mask) | strict_far
         kept = df.loc[keep].copy()
         case_total = int(df["case_id"].astype(str).nunique()) if "case_id" in df.columns else 0
@@ -6142,6 +6585,8 @@ def _calibrate_parity_thresholds_from_train(
     default_odd_inner_outer_min: float,
     default_tangential_radial_min: float,
     event_min_floor: float = 0.05,
+    far_rate_cap: float = 0.35,
+    margin_floor: float = 0.15,
     constrain_min_thresholds: bool = False,
 ) -> dict[str, Any]:
     defaults = {
@@ -6214,6 +6659,11 @@ def _calibrate_parity_thresholds_from_train(
             tan_candidates = [float(default_tangential_radial_min)]
 
     rows: list[dict[str, Any]] = []
+    safety_contract = ParityCalibrationContract(
+        event_min_floor=float(event_min_floor),
+        far_rate_cap=float(far_rate_cap),
+        margin_floor=float(margin_floor),
+    )
     for odd_thr in odd_candidates:
         for tan_thr in tan_candidates:
             pred = base_vals & (odd_vals >= float(odd_thr)) & (tan_vals >= float(tan_thr))
@@ -6222,13 +6672,21 @@ def _calibrate_parity_thresholds_from_train(
             margin = float(event_rate - far_rate)
             confound_ratio = float(far_rate / max(event_rate, 1e-9))
             floor_penalty = float(max(0.0, float(event_min_floor) - event_rate))
-            safety_ok = bool((event_rate >= far_rate) and (event_rate >= float(event_min_floor)))
+            far_cap_penalty = float(max(0.0, far_rate - float(far_rate_cap)))
+            margin_penalty = float(max(0.0, float(margin_floor) - margin))
+            safety_ok = contract_parity_calibration_safety_ok(
+                event_rate=float(event_rate),
+                far_rate=float(far_rate),
+                contract=safety_contract,
+            )
             # Storm-vs-far separation objective with explicit anti-no-op guard.
             score = float(
                 margin
                 - 0.50 * far_rate
                 - 0.20 * confound_ratio
                 - 2.00 * floor_penalty
+                - 1.50 * far_cap_penalty
+                - 1.50 * margin_penalty
                 + 0.10 * event_rate
             )
             rows.append(
@@ -6240,6 +6698,8 @@ def _calibrate_parity_thresholds_from_train(
                     "margin": margin,
                     "confound_ratio": confound_ratio,
                     "event_floor_penalty": floor_penalty,
+                    "far_cap_penalty": far_cap_penalty,
+                    "margin_penalty": margin_penalty,
                     "score": score,
                     "safety_ok": bool(safety_ok),
                 }
@@ -6254,17 +6714,48 @@ def _calibrate_parity_thresholds_from_train(
     search_df = pd.DataFrame(rows)
     safe_df = search_df.loc[search_df["safety_ok"]].copy()
     if safe_df.empty:
-        best = search_df.sort_values(
+        best_unsafe = search_df.sort_values(
             by=["margin", "score", "event_rate", "far_rate", "confound_ratio"],
             ascending=[False, False, False, True, True],
         ).iloc[0]
-        safety_respected = False
+        return {
+            "available": False,
+            "reason": "no_safe_solution_found",
+            "thresholds": defaults,
+            "defaults": defaults,
+            "safety_respected": False,
+            "best_unsafe_metrics": {
+                "event_rate": float(best_unsafe["event_rate"]),
+                "far_rate": float(best_unsafe["far_rate"]),
+                "margin": float(best_unsafe["margin"]),
+                "confound_ratio": float(best_unsafe.get("confound_ratio", np.nan)),
+                "event_floor_penalty": float(best_unsafe.get("event_floor_penalty", 0.0)),
+                "far_cap_penalty": float(best_unsafe.get("far_cap_penalty", 0.0)),
+                "margin_penalty": float(best_unsafe.get("margin_penalty", 0.0)),
+                "score": float(best_unsafe["score"]),
+            },
+            "objective": {
+                "event_min_floor": float(event_min_floor),
+                "far_rate_cap": float(far_rate_cap),
+                "margin_floor": float(margin_floor),
+                "constrain_min_thresholds": bool(constrain_min_thresholds),
+                "score_formula": (
+                    "margin - 0.50*far_rate - 0.20*confound_ratio - 2.00*event_floor_penalty "
+                    "- 1.50*far_cap_penalty - 1.50*margin_penalty + 0.10*event_rate"
+                ),
+                "safety_constraints": {
+                    "event_rate_min": float(event_min_floor),
+                    "far_rate_max": float(far_rate_cap),
+                    "margin_min": float(margin_floor),
+                },
+            },
+            "search": search_df.sort_values(by=["score", "margin"], ascending=[False, False]).head(200).to_dict(orient="records"),
+        }
     else:
         best = safe_df.sort_values(
             by=["score", "margin", "event_rate", "far_rate", "confound_ratio"],
             ascending=[False, False, False, True, True],
         ).iloc[0]
-        safety_respected = True
     chosen = {
         "odd_inner_outer_min": float(best["odd_inner_outer_min"]),
         "tangential_radial_min": float(best["tangential_radial_min"]),
@@ -6274,19 +6765,31 @@ def _calibrate_parity_thresholds_from_train(
         "reason": "ok",
         "thresholds": chosen,
         "defaults": defaults,
-        "safety_respected": bool(safety_respected),
+        "safety_respected": True,
         "best_metrics": {
             "event_rate": float(best["event_rate"]),
             "far_rate": float(best["far_rate"]),
             "margin": float(best["margin"]),
             "confound_ratio": float(best.get("confound_ratio", np.nan)),
             "event_floor_penalty": float(best.get("event_floor_penalty", 0.0)),
+            "far_cap_penalty": float(best.get("far_cap_penalty", 0.0)),
+            "margin_penalty": float(best.get("margin_penalty", 0.0)),
             "score": float(best["score"]),
         },
         "objective": {
             "event_min_floor": float(event_min_floor),
+            "far_rate_cap": float(far_rate_cap),
+            "margin_floor": float(margin_floor),
             "constrain_min_thresholds": bool(constrain_min_thresholds),
-            "score_formula": "margin - 0.50*far_rate - 0.20*confound_ratio - 2.00*event_floor_penalty + 0.10*event_rate",
+            "score_formula": (
+                "margin - 0.50*far_rate - 0.20*confound_ratio - 2.00*event_floor_penalty "
+                "- 1.50*far_cap_penalty - 1.50*margin_penalty + 0.10*event_rate"
+            ),
+            "safety_constraints": {
+                "event_rate_min": float(event_min_floor),
+                "far_rate_max": float(far_rate_cap),
+                "margin_min": float(margin_floor),
+            },
         },
         "search": search_df.sort_values(by=["score", "margin"], ascending=[False, False]).head(200).to_dict(orient="records"),
     }
@@ -6523,9 +7026,10 @@ def _build_geometry_null_by_mode(
     chosen_nulls = null_names or [
         "theta_roll",
         "theta_scramble_within_ring",
+        "ring_label_scramble",
         "center_swap",
-        "storm_track_reassignment",
-        "time_permutation_within_lead",
+        "storm_track_reassignment_phase_matched",
+        "time_permutation_within_track_phase",
         "lat_band_shuffle_within_month_hour",
         "center_jitter",
         "mirror_axis_jitter",
@@ -6657,15 +7161,15 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
         if left.size > 0 and right.size > 0:
             n = min(left.size, right.size)
             den = np.abs(left[:n]) + np.abs(right[:n]) + 1e-8
-            harmonic = float(np.nanmedian(np.abs(left[:n] - right[:n]) / den))
-        chiral_score = float(np.nanmedian(np.abs(chiral))) if chiral.size > 0 else np.nan
-        odd_score = float(np.nanmedian(np.abs(odd))) if odd.size > 0 else np.nan
-        eta_score = float(np.nanmedian(np.abs(eta))) if eta.size > 0 else np.nan
+            harmonic = _safe_nanmedian(np.abs(left[:n] - right[:n]) / den, default=np.nan)
+        chiral_score = _safe_nanmedian(np.abs(chiral), default=np.nan) if chiral.size > 0 else np.nan
+        odd_score = _safe_nanmedian(np.abs(odd), default=np.nan) if odd.size > 0 else np.nan
+        eta_score = _safe_nanmedian(np.abs(eta), default=np.nan) if eta.size > 0 else np.nan
         tan_dom = np.nan
         if vt.size > 0 and vr.size > 0:
             n = min(vt.size, vr.size)
             denom = np.abs(vr[:n]) + 1e-8
-            tan_dom = float(np.nanmedian(np.abs(vt[:n]) / denom))
+            tan_dom = _safe_nanmedian(np.abs(vt[:n]) / denom, default=np.nan)
         ring_witness = np.nan
         if ("L" in grp.columns) and vt.size > 0 and vr.size > 0:
             lvals = pd.to_numeric(grp["L"], errors="coerce").to_numpy(dtype=float)
@@ -6677,12 +7181,12 @@ def _compute_case_angular_scores(samples: pd.DataFrame) -> pd.DataFrame:
                 ring_series = pd.DataFrame({"L": lvals[valid], "ratio": ratio[valid]}).groupby("L")["ratio"].median()
                 rv = ring_series.to_numpy(dtype=float)
                 if rv.size >= 2:
-                    ring_witness = float(np.nanmedian(rv) - np.nanstd(rv))
+                    ring_witness = float(_safe_nanmedian(rv, default=np.nan) - np.nanstd(rv))
                 elif rv.size == 1:
                     ring_witness = float(rv[0])
         vals = np.asarray([harmonic, chiral_score, odd_score, eta_score, tan_dom, ring_witness], dtype=float)
         vals = vals[np.isfinite(vals)]
-        ang_coh = float(np.nanmedian(vals)) if vals.size > 0 else np.nan
+        ang_coh = _safe_nanmedian(vals, default=np.nan) if vals.size > 0 else np.nan
         hs = harmonic if np.isfinite(harmonic) else np.nan
         os = odd_score if np.isfinite(odd_score) else np.nan
         td = tan_dom if np.isfinite(tan_dom) else np.nan
@@ -6855,8 +7359,8 @@ def _build_angular_witness_report(
         sf = s[(~ev).to_numpy(dtype=bool)] if bool((~ev).any()) else np.array([], dtype=float)
         se = se[np.isfinite(se)]
         sf = sf[np.isfinite(sf)]
-        event_mean = float(np.nanmean(se)) if se.size > 0 else 0.0
-        far_mean = float(np.nanmean(sf)) if sf.size > 0 else 0.0
+        event_mean = _safe_nanmean(se, default=0.0)
+        far_mean = _safe_nanmean(sf, default=0.0)
         return {
             "event_mean": event_mean,
             "far_mean": far_mean,
@@ -7181,14 +7685,14 @@ def _build_parity_confound_dashboard(
                 ),
                 "month": int(t_med.month) if pd.notna(t_med) else None,
                 "hour": int(t_med.hour) if pd.notna(t_med) else None,
-                "mean_abs_O_vector": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_vector"), errors="coerce").to_numpy(dtype=float)))),
-                "mean_abs_O_raw": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_raw"), errors="coerce").to_numpy(dtype=float)))),
-                "mean_abs_O_vorticity": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_vorticity"), errors="coerce").to_numpy(dtype=float)))),
-                "mean_abs_O_local_frame": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_local_frame"), errors="coerce").to_numpy(dtype=float)))),
-                "mean_abs_O_polar_spiral": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_polar_spiral"), errors="coerce").to_numpy(dtype=float)))),
-                "mean_abs_O_polar_chiral": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_polar_chiral"), errors="coerce").to_numpy(dtype=float)))),
-                "mean_abs_O_polar_odd_ratio": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_polar_odd_ratio"), errors="coerce").to_numpy(dtype=float)))),
-                "mean_abs_O_polar_eta": _to_float(np.nanmean(np.abs(pd.to_numeric(grp.get("O_polar_eta"), errors="coerce").to_numpy(dtype=float)))),
+                "mean_abs_O_vector": _to_float(_safe_nanmean(np.abs(pd.to_numeric(grp.get("O_vector"), errors="coerce").to_numpy(dtype=float)), default=np.nan)),
+                "mean_abs_O_raw": _to_float(_safe_nanmean(np.abs(pd.to_numeric(grp.get("O_raw"), errors="coerce").to_numpy(dtype=float)), default=np.nan)),
+                "mean_abs_O_vorticity": _to_float(_safe_nanmean(np.abs(pd.to_numeric(grp.get("O_vorticity"), errors="coerce").to_numpy(dtype=float)), default=np.nan)),
+                "mean_abs_O_local_frame": _to_float(_safe_nanmean(np.abs(pd.to_numeric(grp.get("O_local_frame"), errors="coerce").to_numpy(dtype=float)), default=np.nan)),
+                "mean_abs_O_polar_spiral": _to_float(_safe_nanmean(np.abs(pd.to_numeric(grp.get("O_polar_spiral"), errors="coerce").to_numpy(dtype=float)), default=np.nan)),
+                "mean_abs_O_polar_chiral": _to_float(_safe_nanmean(np.abs(pd.to_numeric(grp.get("O_polar_chiral"), errors="coerce").to_numpy(dtype=float)), default=np.nan)),
+                "mean_abs_O_polar_odd_ratio": _to_float(_safe_nanmean(np.abs(pd.to_numeric(grp.get("O_polar_odd_ratio"), errors="coerce").to_numpy(dtype=float)), default=np.nan)),
+                "mean_abs_O_polar_eta": _to_float(_safe_nanmean(np.abs(pd.to_numeric(grp.get("O_polar_eta"), errors="coerce").to_numpy(dtype=float)), default=np.nan)),
                 "mirror_ks_stat_O": ks_stat,
                 "mirror_ks_pvalue_O": ks_p,
                 "axis_robust": bool(axis_meta.get("axis_robust", False)),
@@ -7212,21 +7716,21 @@ def _build_parity_confound_dashboard(
         summary["by_case_type"][str(k)] = {
             "n_cases": int(grp.shape[0]),
             "parity_signal_rate_effective": float(pd.to_numeric(grp["parity_signal_pass_effective"], errors="coerce").fillna(0).mean()),
-            "eta_mean_median": float(np.nanmedian(pd.to_numeric(grp["eta_mean"], errors="coerce"))),
-            "eta_sign_consistency_median": float(np.nanmedian(pd.to_numeric(grp["eta_sign_consistency"], errors="coerce"))),
-            "mirror_ks_stat_median": float(np.nanmedian(pd.to_numeric(grp["mirror_ks_stat_O"], errors="coerce"))),
+            "eta_mean_median": _safe_nanmedian(pd.to_numeric(grp["eta_mean"], errors="coerce"), default=0.0),
+            "eta_sign_consistency_median": _safe_nanmedian(pd.to_numeric(grp["eta_sign_consistency"], errors="coerce"), default=0.0),
+            "mirror_ks_stat_median": _safe_nanmedian(pd.to_numeric(grp["mirror_ks_stat_O"], errors="coerce"), default=0.0),
         }
     for k, grp in out.groupby("center_source", dropna=False):
         summary["by_center_source"][str(k)] = {
             "n_cases": int(grp.shape[0]),
             "parity_signal_rate_effective": float(pd.to_numeric(grp["parity_signal_pass_effective"], errors="coerce").fillna(0).mean()),
-            "eta_mean_median": float(np.nanmedian(pd.to_numeric(grp["eta_mean"], errors="coerce"))),
+            "eta_mean_median": _safe_nanmedian(pd.to_numeric(grp["eta_mean"], errors="coerce"), default=0.0),
         }
     for k, grp in out.groupby("storm_distance_cohort", dropna=False):
         summary["by_distance_cohort"][str(k)] = {
             "n_cases": int(grp.shape[0]),
             "parity_signal_rate_effective": float(pd.to_numeric(grp["parity_signal_pass_effective"], errors="coerce").fillna(0).mean()),
-            "eta_mean_median": float(np.nanmedian(pd.to_numeric(grp["eta_mean"], errors="coerce"))),
+            "eta_mean_median": _safe_nanmedian(pd.to_numeric(grp["eta_mean"], errors="coerce"), default=0.0),
         }
     return out, summary
 
@@ -7239,7 +7743,7 @@ def _build_parity_breakdown(confound_df: pd.DataFrame, *, axis_meta: dict[str, A
         return {
             "n_cases": int(g.shape[0]),
             "parity_signal_rate_effective": float(pd.to_numeric(g["parity_signal_pass_effective"], errors="coerce").fillna(0).mean()),
-            "eta_mean_median": float(np.nanmedian(pd.to_numeric(g["eta_mean"], errors="coerce"))),
+            "eta_mean_median": _safe_nanmedian(pd.to_numeric(g["eta_mean"], errors="coerce"), default=0.0),
         }
 
     by_cohort = {str(k): _agg(g) for k, g in confound_df.groupby("case_type", dropna=False)}
@@ -8076,6 +8580,11 @@ def _build_claim_contract(
                     else float(getattr(args, "parity_inner_ring_quantile", 0.5))
                 ),
                 "calibration_event_min_floor": float(getattr(args, "parity_calibration_event_min_floor", 0.05)),
+                "calibration_far_rate_cap": float(getattr(args, "parity_calibration_far_rate_cap", 0.35)),
+                "calibration_margin_floor": float(getattr(args, "parity_calibration_margin_floor", 0.15)),
+                "min_calib_event_cases": int(getattr(args, "min_calib_event_cases", 10)),
+                "min_calib_far_cases": int(getattr(args, "min_calib_far_cases", 20)),
+                "calib_skip_default_threshold": float(getattr(args, "calib_skip_default_threshold", 0.5)),
                 "calibration_constrain_min_thresholds": bool(getattr(args, "parity_calibration_constrain_min_thresholds", False)),
                 "far_quality_tags": [str(v) for v in (summary.get("claim_far_quality_tags", []) or [])],
                 "strict_far_min_row_quality_frac": float(getattr(args, "strict_far_min_row_quality_frac", 0.0)),

@@ -297,6 +297,33 @@ def test_select_canonical_anomaly_mode_by_lead_returns_mapping() -> None:
     assert "120" in sel["canonical_mode_by_lead"]
 
 
+def test_parity_calibration_rejects_no_safe_solution() -> None:
+    mod = _load_eval_module()
+    # Deliberately no parity detections in either cohort; unsafe "all-off" calibration must be rejected.
+    train_case_metrics = pd.DataFrame(
+        {
+            "case_id": ["e1", "e2", "f1", "f2"],
+            "split_stratum": ["events", "events", "far_nonstorm", "far_nonstorm"],
+            "parity_signal_pass": [False, False, False, False],
+            "odd_energy_inner_outer_ratio": [1.2, 1.3, 1.1, 1.0],
+            "tangential_radial_ratio": [1.2, 1.4, 1.0, 0.9],
+        }
+    )
+    out = mod._calibrate_parity_thresholds_from_train(
+        train_case_metrics=train_case_metrics,
+        default_odd_inner_outer_min=1.1,
+        default_tangential_radial_min=1.1,
+        event_min_floor=0.05,
+        far_rate_cap=0.35,
+        margin_floor=0.15,
+        constrain_min_thresholds=True,
+    )
+    assert out["available"] is False
+    assert out["reason"] == "no_safe_solution_found"
+    assert out["thresholds"]["odd_inner_outer_min"] == 1.1
+    assert out["thresholds"]["tangential_radial_min"] == 1.1
+
+
 def test_angular_witness_report_requires_theta_roll_drop() -> None:
     mod = _load_eval_module()
     obs = pd.DataFrame(

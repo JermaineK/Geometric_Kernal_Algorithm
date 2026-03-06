@@ -299,6 +299,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pre-hours", type=int, default=240, help="Hours before onset to include")
     parser.add_argument("--post-hours", type=int, default=48, help="Hours after onset to include")
+    parser.add_argument(
+        "--slice-interval-hours",
+        type=float,
+        default=12.0,
+        help="Temporal slice interval (hours) used when deduplicating IBTrACS fix-level event slices",
+    )
+    parser.add_argument(
+        "--spatial-dedup-deg",
+        type=float,
+        default=0.5,
+        help="Spatial dedup cell size (degrees) used for IBTrACS fix-level event slices",
+    )
     parser.add_argument("--tile-half-cells", type=int, default=10, help="Half-width in grid cells (10 -> 21x21)")
     parser.add_argument(
         "--scales",
@@ -515,6 +527,9 @@ def main() -> int:
                 lead_buckets=lead_buckets,
                 max_events_per_lead=int(args.max_events_per_lead),
                 rng=rng,
+                pre_hours=int(args.pre_hours),
+                slice_interval_hours=float(args.slice_interval_hours),
+                spatial_dedup_deg=float(args.spatial_dedup_deg),
             )
         elif event_source_requested == "hybrid":
             if not ib_points_hourly.empty or not ib_points_filtered.empty:
@@ -523,6 +538,9 @@ def main() -> int:
                     lead_buckets=lead_buckets,
                     max_events_per_lead=int(args.max_events_per_lead),
                     rng=rng,
+                    pre_hours=int(args.pre_hours),
+                    slice_interval_hours=float(args.slice_interval_hours),
+                    spatial_dedup_deg=float(args.spatial_dedup_deg),
                 )
                 event_source_effective = "ibtracs"
             if not events:
@@ -596,6 +614,9 @@ def main() -> int:
             raise RuntimeError("No storm centers were found for requested lead buckets")
         for event in events:
             event.setdefault("center_source", str(event_source_effective))
+            event.setdefault("lead_h", float(_lead_hours(event.get("lead_bucket"))))
+            event.setdefault("phase", "build" if float(event.get("lead_h", 0.0)) > 48.0 else "relax")
+            event.setdefault("sid", str(event.get("storm_id", event.get("case_id", ""))))
         if (not storm_tracks_df.empty) and (not ib_points_filtered.empty or not ib_points_hourly.empty):
             try:
                 ib_points = ib_points_match if not ib_points_match.empty else (ib_points_filtered if not ib_points_filtered.empty else ib_points_hourly)
@@ -1119,6 +1140,9 @@ def main() -> int:
             "center_source",
             "control_tier",
             "match_quality",
+            "sid",
+            "phase",
+            "lead_h",
             "t_source",
             "t_valid",
             "storm_match_time",
@@ -1172,6 +1196,9 @@ def main() -> int:
             "w_far",
             "eventness",
             "farness",
+            "sample_weight",
+            "xi_star_prior_km",
+            "xi_star_ratio",
         )
         if c in samples.columns
     ]
@@ -1263,6 +1290,8 @@ def main() -> int:
             "handedness": "hand",
             "group": "case_id",
             "observable": ["O"],
+            "phase": "phase",
+            "sample_weight": "sample_weight",
         },
         "preprocessing": {
             "anomaly_mode": str(args.anomaly_mode),
@@ -1282,6 +1311,8 @@ def main() -> int:
             "physical_speed_bin_ms": float(args.physical_speed_bin_ms),
             "physical_zeta_bin": float(args.physical_zeta_bin),
             "min_distinct_scales_per_case": int(args.min_distinct_scales_per_case),
+            "slice_interval_hours": float(args.slice_interval_hours),
+            "spatial_dedup_deg": float(args.spatial_dedup_deg),
             "min_controls_per_lead_bucket": int(args.min_controls_per_lead_bucket),
             "min_far_nonstorm_per_lead_bucket": int(args.min_far_nonstorm_per_lead_bucket),
             "adaptive_control_coverage": bool(args.adaptive_control_coverage),
@@ -1386,6 +1417,8 @@ def main() -> int:
         "physical_speed_bin_ms": float(args.physical_speed_bin_ms),
         "physical_zeta_bin": float(args.physical_zeta_bin),
         "min_distinct_scales_per_case": int(args.min_distinct_scales_per_case),
+        "slice_interval_hours": float(args.slice_interval_hours),
+        "spatial_dedup_deg": float(args.spatial_dedup_deg),
         "min_controls_per_lead_bucket": int(args.min_controls_per_lead_bucket),
         "min_far_nonstorm_per_lead_bucket": int(args.min_far_nonstorm_per_lead_bucket),
         "adaptive_control_coverage": bool(args.adaptive_control_coverage),
@@ -1674,38 +1707,121 @@ def _collect_ibtracs_centers(
     lead_buckets: list[str],
     max_events_per_lead: int,
     rng: np.random.Generator,
+    pre_hours: int,
+    slice_interval_hours: float,
+    spatial_dedup_deg: float,
 ) -> list[dict[str, Any]]:
     ib = ib_points.copy()
     if ib.empty:
         return []
+    sid_col = "storm_id" if "storm_id" in ib.columns else ("sid" if "sid" in ib.columns else None)
+    if sid_col is None:
+        return []
     ib["time"] = pd.to_datetime(ib["time"], errors="coerce")
-    ib = ib.dropna(subset=["time", "lat0", "lon0", "storm_id"]).copy()
+    ib["lat0"] = pd.to_numeric(ib.get("lat0"), errors="coerce")
+    ib["lon0"] = pd.to_numeric(ib.get("lon0"), errors="coerce")
+    ib = ib.dropna(subset=["time", "lat0", "lon0", sid_col]).copy()
     if ib.empty:
         return []
+    ib["storm_id"] = ib[sid_col].astype(str)
+    ib = ib.sort_values(["storm_id", "time"]).drop_duplicates(subset=["storm_id", "time"], keep="first").reset_index(drop=True)
+
+    # Genesis proxy: prefer first 34kt crossing when available; fallback to latest available fix in-window.
+    if "genesis_time" in ib.columns:
+        genesis_map = (
+            ib.assign(genesis_time=pd.to_datetime(ib["genesis_time"], errors="coerce"))
+            .dropna(subset=["storm_id", "genesis_time"])
+            .groupby("storm_id", as_index=False)["genesis_time"]
+            .min()
+            .set_index("storm_id")["genesis_time"]
+            .to_dict()
+        )
+    else:
+        genesis_map: dict[str, pd.Timestamp] = {}
+        for sid, grp in ib.groupby("storm_id", sort=False):
+            g = grp.sort_values("time").copy()
+            genesis_t: pd.Timestamp | None = None
+            if "wind" in g.columns:
+                wind = pd.to_numeric(g["wind"], errors="coerce")
+                # IBTrACS wind often reported in knots; 34kt is the tropical-storm threshold.
+                hit = g.loc[wind >= 34.0, "time"]
+                if not hit.empty:
+                    genesis_t = pd.Timestamp(hit.iloc[0])
+            if genesis_t is None:
+                # Use latest known point as a stable pre-window anchor when explicit genesis is unavailable.
+                genesis_t = pd.Timestamp(g["time"].max())
+            genesis_map[str(sid)] = pd.Timestamp(genesis_t)
+
+    def _lead_bucket_from_hours(lead_h: float) -> str:
+        candidates: list[float] = []
+        labels: list[str] = []
+        for raw in lead_buckets:
+            txt = str(raw).strip().lower()
+            if txt in {"", "none", "nan", "null"}:
+                continue
+            try:
+                candidates.append(float(txt))
+                labels.append(str(raw))
+            except Exception:
+                continue
+        if not candidates:
+            return "none" if any(str(v).strip().lower() == "none" for v in lead_buckets) else str(lead_buckets[0])
+        idx = int(np.argmin(np.abs(np.asarray(candidates, dtype=float) - float(lead_h))))
+        return str(labels[idx])
+
+    slice_h = max(float(slice_interval_hours), 1.0)
+    dedup_deg = max(float(spatial_dedup_deg), 1e-6)
+    max_pre_h = max(float(pre_hours), 0.0)
+    by_lead: dict[str, list[dict[str, Any]]] = {}
+    seen_cells: set[tuple[str, int, int, int]] = set()
+    for _, row in ib.iterrows():
+        sid = str(row["storm_id"])
+        fix_t = pd.Timestamp(row["time"])
+        genesis_t = pd.Timestamp(genesis_map.get(sid, fix_t))
+        lead_h = float((genesis_t - fix_t).total_seconds() / 3600.0)
+        if (not np.isfinite(lead_h)) or lead_h < 0.0 or lead_h > max_pre_h:
+            continue
+        time_bucket = int(np.floor(lead_h / slice_h))
+        lat_c = float(row["lat0"])
+        lon_c = float(row["lon0"])
+        lat_cell = int(np.round(lat_c / dedup_deg))
+        lon_cell = int(np.round(lon_c / dedup_deg))
+        dedup_key = (sid, time_bucket, lat_cell, lon_cell)
+        if dedup_key in seen_cells:
+            continue
+        seen_cells.add(dedup_key)
+        lead_bucket = _lead_bucket_from_hours(lead_h)
+        phase = "build" if lead_h > 48.0 else "relax"
+        ev = {
+            "case_id": f"{sid}_L{int(np.round(lead_h)):04d}_{lat_cell}_{lon_cell}",
+            "case_type": "storm",
+            "event_label": "ibtracs",
+            "storm_id": sid,
+            "sid": sid,
+            "lead_bucket": str(lead_bucket),
+            "lead_h": float(lead_h),
+            "phase": str(phase),
+            "fix_time": fix_t,
+            "genesis_time": genesis_t,
+            "time0": fix_t,
+            "lat0": lat_c,
+            "lon0": lon_c,
+            "lat_center": lat_c,
+            "lon_center": lon_c,
+            "speed_bin": None,
+            "zeta_bin": None,
+            "track_id": None,
+            "center_source": "ibtracs",
+        }
+        by_lead.setdefault(str(lead_bucket), []).append(ev)
+
     out: list[dict[str, Any]] = []
-    for lead in lead_buckets:
-        take = ib.copy()
-        take = take.sort_values(["storm_id", "time"]).drop_duplicates(subset=["storm_id", "time"], keep="first").reset_index(drop=True)
-        if take.shape[0] > int(max_events_per_lead):
-            sel = np.sort(rng.choice(take.index.to_numpy(), size=int(max_events_per_lead), replace=False))
-            take = take.loc[sel].reset_index(drop=True)
-        for i, row in take.iterrows():
-            out.append(
-                {
-                    "case_id": f"storm_lead{lead}_{i:04d}",
-                    "case_type": "storm",
-                    "event_label": "ibtracs",
-                    "storm_id": str(row["storm_id"]),
-                    "lead_bucket": str(lead),
-                    "time0": pd.Timestamp(row["time"]),
-                    "lat0": float(row["lat0"]),
-                    "lon0": float(row["lon0"]),
-                    "speed_bin": None,
-                    "zeta_bin": None,
-                    "track_id": None,
-                    "center_source": "ibtracs",
-                }
-            )
+    for lead, rows in by_lead.items():
+        take = list(rows)
+        if len(take) > int(max_events_per_lead):
+            idx = np.sort(rng.choice(np.arange(len(take), dtype=int), size=int(max_events_per_lead), replace=False))
+            take = [take[int(i)] for i in idx]
+        out.extend(take)
     return out
 
 
@@ -1729,6 +1845,9 @@ def _make_offset_controls(
                 "center_source": "background",
                 "storm_id": str(event.get("storm_id", event["case_id"])),
                 "lead_bucket": event["lead_bucket"],
+                "lead_h": float(event.get("lead_h", _lead_hours(event.get("lead_bucket")))),
+                "phase": "control",
+                "sid": str(event.get("sid", event.get("storm_id", event["case_id"]))),
                 "time0": event["time0"],
                 "lat0": event["lat0"],
                 "lon0": lon,
@@ -1855,6 +1974,9 @@ def _make_matched_background_controls(
                         "center_source": "background",
                         "storm_id": f"background_matched_{lead}_{len(controls):04d}",
                         "lead_bucket": str(lead),
+                        "lead_h": float(event.get("lead_h", _lead_hours(lead))),
+                        "phase": "control",
+                        "sid": str(event.get("sid", event.get("storm_id", event.get("case_id", "")))),
                         "time0": pd.Timestamp(pick["time"]),
                         "lat0": float(pick["lat"]),
                         "lon0": float(pick["lon"]),
@@ -2126,6 +2248,9 @@ def _collect_background_centers(
                     "center_source": "background",
                     "storm_id": f"background_{lead}_{i:04d}",
                     "lead_bucket": str(lead),
+                    "lead_h": _lead_hours(lead),
+                    "phase": "control",
+                    "sid": f"background_{lead}_{i:04d}",
                     "time0": pd.Timestamp(row["time"]),
                     "lat0": float(row["lat"]),
                     "lon0": float(row["lon"]),
@@ -2362,6 +2487,10 @@ def _extract_case_rows(
     polar_rows: list[dict[str, Any]] = []
     scale_point_counts: dict[str, int] = {}
     scales_used_cells: list[int] = []
+    xi_star_prior_km = rossby_deformation_radius_km(lat0)
+    case_phase = str(case.get("phase", "build" if float(case.get("lead_h", 0.0)) > 48.0 else "relax"))
+    genesis_time = pd.to_datetime(case.get("genesis_time"), errors="coerce")
+    case_lead_h = float(case.get("lead_h", _lead_hours(lead)))
     for scale in scales:
         half = (int(scale) // 2) * float(grid_step_deg)
         mask = (np.abs(frame["lat"] - lat0) <= half) & (np.abs(frame["lon"] - lon0) <= half)
@@ -2399,6 +2528,9 @@ def _extract_case_rows(
         for _, row in agg.iterrows():
             t_val = pd.Timestamp(row["time"])
             t_rel_h = float((t_val - t0).total_seconds() / 3600.0)
+            lead_h_slice = float((genesis_time - t_val).total_seconds() / 3600.0) if not pd.isna(genesis_time) else float(case_lead_h)
+            if not np.isfinite(lead_h_slice):
+                lead_h_slice = float(case_lead_h)
             o_l = float(row["O_L"])
             o_r = float(row["O_R"])
             if not (np.isfinite(o_l) and np.isfinite(o_r)):
@@ -2529,18 +2661,25 @@ def _extract_case_rows(
             common = {
                 "case_id": case["case_id"],
                 "case_type": case["case_type"],
+                "sid": str(case.get("sid", case.get("storm_id", case["case_id"]))),
                 "center_source": case.get("center_source"),
                 "match_quality": case.get("match_quality"),
                 "control_tier": case.get("control_tier"),
                 "lead_bucket": lead,
+                "lead_h": float(lead_h_slice),
+                "phase": str(case_phase),
                 "t": t_val,
                 "L": L_km,
                 "omega": 1.0,
                 "t_rel_h": t_rel_h,
                 "onset_time": t0,
+                "fix_time": pd.to_datetime(case.get("fix_time"), errors="coerce"),
+                "genesis_time": pd.to_datetime(case.get("genesis_time"), errors="coerce"),
                 "storm_id": str(case.get("storm_id", case["case_id"])),
                 "lat0": float(lat0),
                 "lon0": float(lon0),
+                "lat_center": float(case.get("lat_center", lat0)),
+                "lon_center": float(case.get("lon_center", lon0)),
                 "dist_from_event_deg": (
                     float(case.get("dist_from_event_deg"))
                     if case.get("dist_from_event_deg") is not None
@@ -2570,6 +2709,9 @@ def _extract_case_rows(
                 "ib_far_strict_case": bool(case.get("ib_far_strict", case.get("ib_far", False))),
                 "ib_far_quality_tag": case.get("ib_far_quality_tag"),
                 "eta_parity_mean": float(row["eta_parity"]),
+                "sample_weight": float(phase_sample_weight(float(lead_h_slice), str(case_phase), multipolar_order=1)),
+                "xi_star_prior_km": float(xi_star_prior_km),
+                "xi_star_ratio": float(L_km / max(float(xi_star_prior_km), 1e-6)),
                 "storm": int(storm_v),
                 "near_storm": int(near_v),
                 "pregen": int(pregen_v),
@@ -4194,6 +4336,29 @@ def _lead_hours(lead_bucket: Any) -> float:
         return float(text)
     except Exception:
         return 0.0
+
+
+def rossby_deformation_radius_km(lat_deg: float, N: float = 0.01, H_km: float = 8.0) -> float:
+    """Rossby deformation radius prior: xi* = N H / f, returned in km."""
+
+    omega = 7.2921e-5
+    f = 2.0 * omega * abs(np.sin(np.radians(float(lat_deg))))
+    f = max(float(f), 1e-6)
+    radius_m = (float(N) * (float(H_km) * 1000.0)) / f
+    return float(radius_m / 1000.0)
+
+
+def phase_sample_weight(lead_h: float, phase: str, multipolar_order: int = 1) -> float:
+    """Prethermal-inspired lead-time weighting in [0.1, 1.0]."""
+
+    alpha = max(1, 2 * int(multipolar_order) + 1)
+    lh = max(float(lead_h), 1.0)
+    raw = (1.0 / lh) ** (1.0 / float(alpha))
+    ref = (1.0 / 6.0) ** (1.0 / float(alpha))
+    base = raw / max(ref, 1e-8)
+    if str(phase).strip().lower() == "build":
+        base *= 0.9
+    return float(np.clip(base, 0.1, 1.0))
 
 
 def _valid_time_from_components(time_value: Any, lead_bucket: Any, *, use_lead_shift: bool = False) -> pd.Timestamp:
